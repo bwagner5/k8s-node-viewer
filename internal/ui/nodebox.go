@@ -37,9 +37,9 @@ type borderSet struct {
 }
 
 var (
-	borderSolid  = borderSet{'╭', '╮', '╰', '╯', '─', '│'}
-	borderDashed = borderSet{'╭', '╮', '╰', '╯', '┄', '┊'}
-	borderHeavy  = borderSet{'┏', '┓', '┗', '┛', '━', '┃'}
+	borderSolid       = borderSet{'╭', '╮', '╰', '╯', '─', '│'}
+	borderHeavy       = borderSet{'┏', '┓', '┗', '┛', '━', '┃'}
+	borderHeavyDashed = borderSet{'┏', '┓', '┗', '┛', '╍', '╏'}
 )
 
 // boxCtx is everything the box renderer needs beyond the node itself. Passing a
@@ -49,6 +49,7 @@ type boxCtx struct {
 	mode     Mode
 	now      time.Time
 	selected bool
+	actions  map[string]consolidationMember
 }
 
 // renderNodeBox draws one node into exactly h lines of width w.
@@ -157,11 +158,15 @@ func renderNodeBox(v visible, w, h int, ctx boxCtx) []string {
 func borderStyle(n *model.Node, track *anim.Track, ctx boxCtx) (borderSet, lipgloss.Color) {
 	t := theme.Current
 	base := phaseEdge(n.Phase)
-	set := borderSolid
+	// Every node gets the heavy outline. Terminal cells cannot make a stroke
+	// physically wider, so the heavy box-drawing family is the closest analogue
+	// to the strong card edge used in the visual mockup. Ready remains muted and
+	// therefore quiet even with the stronger glyphs.
+	set := borderHeavy
 
 	switch n.Phase {
 	case model.PhaseProvisioning:
-		set = borderDashed
+		set = borderHeavyDashed
 		// Breathe toward the background: "not here yet".
 		base = theme.Mix(t.Bg, base, 0.45+0.55*ctx.reg.Pulse(track, pulseProvisioning))
 	case model.PhaseDraining:
@@ -242,7 +247,7 @@ func drawTitleBar(c *canvas, w, y int, v visible, col lipgloss.Color, ctx boxCtx
 	c.rect(1, y, w-2, 1, bg)
 
 	fg := contrastOn(bg)
-	badge := phaseBadgeForWidth(n.Phase, max(1, w-9))
+	badge, badgeCol := nodeBadgeForWidth(n, ctx, col, max(1, w-9))
 	chipW := runewidth.StringWidth(badge) + 2
 	badgeX := w - 1 - chipW
 	avail := max(1, badgeX-3)
@@ -251,8 +256,8 @@ func drawTitleBar(c *canvas, w, y int, v visible, col lipgloss.Color, ctx boxCtx
 	}
 	c.text(2, y, shorten(n.Name, avail), fg, true)
 	if badge != "" {
-		c.rect(badgeX, y, chipW, 1, col)
-		c.text(badgeX, y, " "+badge+" ", contrastOn(col), true)
+		c.rect(badgeX, y, chipW, 1, badgeCol)
+		c.text(badgeX, y, " "+badge+" ", contrastOn(badgeCol), true)
 	}
 }
 
@@ -260,7 +265,7 @@ func drawTitleBar(c *canvas, w, y int, v visible, col lipgloss.Color, ctx boxCtx
 func drawTitleInBorder(c *canvas, w int, v visible, col lipgloss.Color, ctx boxCtx, fade float64) {
 	t := theme.Current
 	n := v.node
-	badge := phaseBadgeForWidth(n.Phase, max(1, w-9))
+	badge, badgeCol := nodeBadgeForWidth(n, ctx, col, max(1, w-9))
 	chipW := runewidth.StringWidth(badge) + 2
 	badgeX := w - 1 - chipW
 	avail := max(1, badgeX-3)
@@ -277,9 +282,22 @@ func drawTitleInBorder(c *canvas, w int, v visible, col lipgloss.Color, ctx boxC
 	}
 	c.text(1, 0, " "+shorten(n.Name, avail)+" ", nameColor, true)
 	if badge != "" {
-		c.rect(badgeX, 0, chipW, 1, col)
-		c.text(badgeX, 0, " "+badge+" ", contrastOn(col), true)
+		c.rect(badgeX, 0, chipW, 1, badgeCol)
+		c.text(badgeX, 0, " "+badge+" ", contrastOn(badgeCol), true)
 	}
+}
+
+// nodeBadgeForWidth layers action membership over lifecycle state. The border
+// still says draining/provisioning/ready; the cyan chip answers the separate
+// question "which consolidation does this node belong to, and in which
+// direction is capacity moving?"
+func nodeBadgeForWidth(n *model.Node, ctx boxCtx, phaseCol lipgloss.Color, maxWidth int) (string, lipgloss.Color) {
+	if member, ok := ctx.actions[n.Name]; ok {
+		if badge := actionBadgeForWidth(member, maxWidth); badge != "" {
+			return badge, theme.Current.Accent
+		}
+	}
+	return phaseBadgeForWidth(n.Phase, maxWidth), phaseCol
 }
 
 // drawFooter writes the bottom-border summary: instance type, pod count, age.

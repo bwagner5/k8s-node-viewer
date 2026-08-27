@@ -81,18 +81,19 @@ func (s *Source) upsertNodeClaim(obj interface{}) {
 	labels := u.GetLabels()
 
 	placeholder := &model.Node{
-		Name:         valueOr(nodeName, u.GetName()),
-		NodeClaim:    u.GetName(),
-		ProviderID:   providerID,
-		NodePool:     labels[labelNodePool],
-		InstanceType: labels[labelInstanceType],
-		Zone:         labels[labelZone],
-		Arch:         labels[labelArch],
-		CapacityType: labels[labelCapacityType],
-		Created:      u.GetCreationTimestamp().Time,
-		Phase:        model.PhaseProvisioning,
-		Message:      claimMessage(u),
-		Labels:       copyLabels(labels),
+		Name:             valueOr(nodeName, u.GetName()),
+		NodeClaim:        u.GetName(),
+		ProviderID:       providerID,
+		NodePool:         labels[labelNodePool],
+		InstanceType:     labels[labelInstanceType],
+		Zone:             labels[labelZone],
+		Arch:             labels[labelArch],
+		CapacityType:     labels[labelCapacityType],
+		Created:          u.GetCreationTimestamp().Time,
+		Phase:            model.PhaseProvisioning,
+		Message:          claimMessage(u),
+		DisruptionReason: claimDisruptionReason(u),
+		Labels:           copyLabels(labels),
 	}
 	// A claim's status.capacity is the instance's real capacity, which lets the
 	// placeholder box be drawn to scale before kubelet registers.
@@ -130,6 +131,27 @@ func claimMessage(u *unstructured.Unstructured) string {
 		}
 	}
 	return "launching"
+}
+
+func claimDisruptionReason(u *unstructured.Unstructured) string {
+	conds, found, _ := unstructured.NestedSlice(u.Object, "status", "conditions")
+	if !found {
+		return ""
+	}
+	for _, raw := range conds {
+		c, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		typ, _, _ := unstructured.NestedString(c, "type")
+		status, _, _ := unstructured.NestedString(c, "status")
+		if typ != "DisruptionReason" || status != "True" {
+			continue
+		}
+		reason, _, _ := unstructured.NestedString(c, "reason")
+		return reason
+	}
+	return ""
 }
 
 // quantityMap parses a map of resource-name to quantity string, as it appears in

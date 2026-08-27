@@ -5,6 +5,9 @@ BIN := knv
 build:
 	go build -o $(BIN) ./cmd/knv
 
+run:
+	go run ./cmd/knv
+
 test:
 	go test ./...
 

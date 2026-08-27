@@ -153,6 +153,25 @@ func TestNodeThenClaimDoesNotDuplicate(t *testing.T) {
 	}
 }
 
+func TestNodeClaimDisruptionReasonSurvivesHandover(t *testing.T) {
+	s := NewStore("test")
+	const name = "karpenter-default-disrupting"
+	claim := claimPlaceholder(name, name)
+	claim.DisruptionReason = "Underutilized"
+	s.UpsertClaim(name, claim)
+	s.UpsertNode(registeredNode(name))
+
+	got := s.Snapshot().Nodes[0]
+	if got.DisruptionReason != "Underutilized" {
+		t.Fatalf("disruption reason after claim handover = %q, want Underutilized", got.DisruptionReason)
+	}
+	cleared := claimPlaceholder(name, name)
+	s.UpsertClaim(name, cleared)
+	if got := s.Snapshot().Nodes[0].DisruptionReason; got != "" {
+		t.Fatalf("cleared disruption reason remained %q", got)
+	}
+}
+
 // TestClaimAdoptionCarriesPricing checks the placeholder is not merely dropped:
 // the claim is the only source of pool and price, so that data must survive.
 func TestClaimAdoptionCarriesPricing(t *testing.T) {

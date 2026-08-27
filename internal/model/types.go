@@ -158,6 +158,10 @@ type Node struct {
 	// Message is a short human reason for the current phase, shown on the
 	// selected node's detail line ("disrupted: underutilized").
 	Message string
+	// DisruptionReason is Karpenter's NodeClaim condition reason while the claim
+	// is actively being disrupted (for example Underutilized or Drifted). Unlike
+	// a consolidatable verdict, this is evidence that an action is underway.
+	DisruptionReason string
 
 	Created   time.Time
 	DeletedAt time.Time // zero unless tombstoned

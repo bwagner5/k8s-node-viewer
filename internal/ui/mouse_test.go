@@ -26,8 +26,7 @@ func flick(m *Model, btn tea.MouseButton, notches int) {
 // same way the renderer works it out.
 
 func gridTop(m *Model) int {
-	f := m.layoutFrame()
-	return f.header + f.legend
+	return m.layoutFrame().gridTop()
 }
 
 // cardXY is the screen position of the top-left cell of card idx.
@@ -706,7 +705,7 @@ func TestGuttersAndMarginsStillAim(t *testing.T) {
 	}
 	f := m.layoutFrame()
 	margin := 1 // hard against the left edge, outside the canvas
-	y := f.header + f.legend + m.lay.boxH/2
+	y := f.gridTop() + m.lay.boxH/2
 
 	if _, ok := m.hitTest(margin, y); ok {
 		t.Fatal("the margin is inside the canvas; the test proves nothing")

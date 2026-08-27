@@ -17,6 +17,9 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	// Playback controls are genuinely global: a presenter must be able to pause
 	// or catch up without first closing the detail pane or help overlay.
 	switch msg.String() {
+	case "R":
+		m.toggleRecording()
+		return nil
 	case "p":
 		m.togglePause()
 		return nil
@@ -27,6 +30,18 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		} else {
 			m.showSeekOverlay(moved)
 			m.notify(fmt.Sprintf("rewound %s · %s", moved.Round(time.Millisecond),
+				playbackStatus(m.playback, time.Now())), false)
+		}
+		return cmd
+	case "]":
+		cmd, moved := m.forwardPlayback(keyRewindStep)
+		if moved == 0 {
+			m.notify("already at the newest recorded state", true)
+		} else {
+			// Negative is the forward direction for the signed seek badge; the
+			// existing positive convention is rewind.
+			m.showSeekOverlay(-moved)
+			m.notify(fmt.Sprintf("forward %s · %s", moved.Round(time.Millisecond),
 				playbackStatus(m.playback, time.Now())), false)
 		}
 		return cmd
@@ -550,7 +565,7 @@ func (m *Model) recordMouse(msg tea.MouseMsg) {
 		hit = fmt.Sprintf("~%d %s", idx, m.vis[idx].node.Name)
 	}
 	m.lastMouse = fmt.Sprintf("%s @%d,%d grid@%d+%d hit[%s] sel[%s] pan%d,%d box%dx%d cols%d",
-		tea.MouseEvent(msg).String(), msg.X, msg.Y, f.header+f.legend, f.grid,
+		tea.MouseEvent(msg).String(), msg.X, msg.Y, f.gridTop(), f.grid,
 		hit, m.cursorName, m.panX, m.panY, m.lay.boxW, m.lay.boxH, m.lay.cols)
 }
 
@@ -574,7 +589,7 @@ func (m *Model) nearestCard(x, y int) (int, bool) {
 	// way gutters are clamped would map every stray coordinate to an edge card —
 	// and a y below the grid to the *last* row, which is a corner. Say no, and
 	// let the caller fall back to something that cannot walk anywhere.
-	rel := y - f.header - f.legend
+	rel := y - f.gridTop()
 	if rel < 0 || rel >= f.grid {
 		return 0, false
 	}
@@ -596,7 +611,7 @@ func (m *Model) nearestCard(x, y int) (int, bool) {
 // counts their rows puts every click a card too high.
 func (m *Model) hitTest(x, y int) (int, bool) {
 	f := m.layoutFrame()
-	top := f.header + f.legend
+	top := f.gridTop()
 	if y < top || y >= top+f.grid {
 		return 0, false
 	}

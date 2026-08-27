@@ -60,6 +60,20 @@ func TestParsePriceRejectsMissingOrInvalidConfiguredAnnotation(t *testing.T) {
 	}
 }
 
+func TestNodeClaimDisruptionReasonCondition(t *testing.T) {
+	claim := &unstructured.Unstructured{Object: map[string]interface{}{
+		"status": map[string]interface{}{
+			"conditions": []interface{}{
+				map[string]interface{}{"type": "Ready", "status": "False", "reason": "Initializing"},
+				map[string]interface{}{"type": "DisruptionReason", "status": "True", "reason": "Underutilized"},
+			},
+		},
+	}}
+	if got := claimDisruptionReason(claim); got != "Underutilized" {
+		t.Fatalf("disruption reason = %q, want Underutilized", got)
+	}
+}
+
 // TestConvertPodSchedulingState pins the distinction the pending meter is built
 // on: a pod nobody has looked at yet is waiting, and only the scheduler's own
 // verdict makes it unschedulable.

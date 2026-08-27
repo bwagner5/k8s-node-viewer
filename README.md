@@ -34,6 +34,8 @@ go build -o knv ./cmd/knv
 ./knv --price-annotation example.com/hourly-price
 ./knv --demo                   # simulated cluster, no cluster required
 ./knv --demo --playback-speed 0.5
+./knv --record incident.knv    # record a live session
+./knv --replay incident.knv    # replay it later, without a cluster
 ```
 
 `--demo` runs a self-contained simulation. Use it to rehearse: the seed is
@@ -57,7 +59,9 @@ somewhere to put them).
 | `v` | cycle pods → nodes → dense |
 | `p` | pause/resume the cluster timeline |
 | `[` | rewind five seconds (repeat to go farther) |
-| `r` | discard buffered history and jump to real-time |
+| `]` | move forward five seconds through buffered or recorded history |
+| `r` | jump to real-time, or to the end of a recording |
+| `R` | start or stop recording the current session |
 | `d` | dense table mode |
 | `s` / `S` | cycle sort / reverse |
 | `l` | toggle legend |
@@ -162,9 +166,11 @@ Enter lists the Karpenter NodePools to choose from.
 :zoom <in|out|fit|max>      card size; max is one node, full screen  (:z)
 :mode <pods|nodes|dense>    change the view                     (:m)
 :sort <key>                 name, cpu, mem, pods, age, nodepool, type
-:speed <0x…1x|realtime>     cluster playback rate; 0x pauses
+:speed <rate|realtime/end>  cluster or recorded playback rate; 0x pauses
 :pause / :resume            pause or resume at the previous rate
 :rewind <duration>          rewind by e.g. 5s or 20s             (:back)
+:forward <duration>         seek forward by e.g. 5s or 20s       (:ahead)
+:record [path|stop|status]  start/stop recording; path is optional (:rec)
 :theme <dark|light>         palette
 :legend <on|off>            colour legend
 :quit                       exit
@@ -202,6 +208,55 @@ with `--history-duration` and `--history-memory`. If the snapshot buffer reaches
 either limit, the viewer returns to real-time with a warning rather than silently
 dropping lifecycle transitions.
 
+### Recording and replay
+
+Recording can begin at startup with `--record <path>`, or while the viewer is
+running with `R` or `:record [path]`. `R` and bare `:record` toggle recording;
+`:record stop` stops it explicitly and `:record status` reports its current
+state. Starting without a path chooses the first unused name under
+`~/.config/knv`, beginning with `recording001.knv`. An explicit path may use `~`.
+
+The status line carries a `REC:<filename>` chip while capture is active. Starting
+and stopping also shows a toast; the stop toast includes the absolute saved path.
+When knv exits—whether through `q`, Ctrl+C, or a signal—it cleanly closes any
+active recording and writes `recording saved to <path>` to stdout for every file
+created during that run, including files stopped earlier from the UI.
+
+Every immutable source snapshot is written before it enters the playback clock,
+so pausing, rewinding, or changing speed during capture cannot change the
+recorded timeline. A recording started at runtime first writes the freshest
+source snapshot as its anchor, even if the visible playback is paused or rewound.
+It also samples node detail and Kubernetes event payloads every five seconds (and
+records on-demand detail reads), making the historical detail pane available
+during replay even if it was never opened while recording.
+
+Recordings are append-only, versioned JSON Lines files. Each line is an
+independently parsable `header`, `snapshot`, `detail`, or `end` object; nested
+snapshot and detail payloads use the same model the renderer consumes. Use a
+`.gz` suffix, such as `incident.knv.gz`, for gzip compression. New recordings
+refuse to overwrite an existing file. Because each record is flushed as it is
+written, an uncompressed file remains loadable through its last complete line
+after an interrupted process; gzip recordings are flushed on every record too.
+
+```sh
+./knv --context prod --record incident.knv.gz
+./knv --replay incident.knv.gz
+./knv --replay incident.knv.gz --playback-speed 4
+```
+
+Replay starts at the first captured state and follows the original source
+timestamps at 1× unless `--playback-speed` selects another rate. `p`, `[`, `]`,
+`:rewind`, `:forward`, and `:speed` remain presentation controls: they never
+modify the loaded events. Archived sessions support rates from 0× through 16×;
+`r`, `:speed end`, or `:speed realtime` jumps to the final recorded state.
+
+Unlike live playback, replay retains the complete loaded timeline and its detail
+samples. `--history-duration` and `--history-memory` do not limit an archive, so
+seeking is bounded only by the beginning and end of the file. This intentionally
+uses memory proportional to the recording. Session files can contain cluster
+names, node and pod metadata, labels, annotations, event messages, and provider
+IDs, so handle them as operational data.
+
 ## Modes
 
 - **pods** — every pod is a cell, sized by CPU request, coloured by state, with
@@ -209,9 +264,10 @@ dropping lifecycle transitions.
 - **nodes** — no pod cells. The whole box becomes two tall gauges with large
   percentages and a pod count. This is what reads from the back of a room.
 - **dense** — one row per node, for clusters with more nodes than boxes will fit.
-  This is the table, and it carries the `CONS` column (below). Columns are dropped
-  as the terminal narrows, in increasing order of value: nodepool, then instance
-  type, then state, then `CONS`.
+  This is the table, and it carries the `CONS` column (below). During an active
+  consolidation it also adds an `ACTION` column (`C1 R↓` / `C1 R↑`), which
+  survives secondary descriptors as the terminal narrows. The middle letter is
+  the action type: `E` empty scale-down, `B` bin-pack scale-down, `R` replacement.
 
 ### Consolidatable (CONS)
 
@@ -236,6 +292,38 @@ Node, and the event routinely arrives before the Node object does. The store key
 verdicts by whichever object was named and joins them to nodes when it builds a
 snapshot, taking the more recent of the two; an older verdict never overwrites a
 newer one, which is what stops the column flickering on every informer resync.
+
+### Active consolidation actions
+
+`CONS=y` is eligibility, not activity. Once a consolidatable node is actually
+disrupted, a one-row ribbon appears between the header and the grid and groups
+the observable sides of the move:
+
+```
+↻ C1  REPLACEMENT  2 out → 1 in · waiting for replacement · 18 pods remaining
+```
+
+The same action ID follows the nodes through every mode. Pod and node cards use
+`C1 ↓ WAITING` / `C1 ↑ STARTING` chips; dense mode compresses those to an
+`ACTION` column. Phase colour remains independent — amber still means draining,
+violet provisioning and green ready — while cyan carries only action membership.
+
+The ribbon names the observed consolidation mechanism rather than treating every
+scale-down as a replacement:
+
+- `EMPTY SCALE-DOWN` — an empty node is simply removed; no replacement is
+  expected and a simultaneous NodePool scale-up is not attached to it.
+- `BIN-PACK SCALE-DOWN` — pods move onto existing cluster capacity and the source
+  node is removed.
+- `REPLACEMENT` — one or more new NodeClaims are the destination; only this type
+  may say `replacement pending`.
+- `CONSOLIDATING` — the action is active but the available event evidence does
+  not identify delete versus replace, so KNV does not guess.
+
+Karpenter does not publish a durable source-to-destination reference for a
+consolidation. KNV therefore groups active consolidation sources with replacement
+NodeClaims created at about the same time in the same NodePool. It does not use
+that inference to change lifecycle state or the `CONS` verdict.
 
 ### Pending pods
 
@@ -346,9 +434,9 @@ it survives a washed-out projector and does not depend on distinguishing hues:
 
 | Phase | Border | Badge |
 |---|---|---|
-| ready | thin, green | — |
-| provisioning | dashed, violet, breathing | `◇ PROVISIONING` |
-| cordoned | thin, blue | `⏸ CORDONED` |
+| ready | heavy, muted green | — |
+| provisioning | heavy dashed, violet, breathing | `◇ PROVISIONING` |
+| cordoned | heavy, blue | `⏸ CORDONED` |
 | draining | heavy, amber, pulsing + diagonal hatch on free capacity | `▼ DRAINING` |
 | terminating | heavy, red, fast pulse | `✕ TERMINATING` |
 | not ready | heavy, orange | `! NOT READY` |
@@ -485,6 +573,11 @@ put the renderer under the API server's event rate.
 
 **Snapshots are immutable.** The UI holds one across frames without locking.
 Sources keep writing into the store meanwhile.
+
+**Recordings sit before playback.** The session writer sees the same immutable
+snapshot sequence the UI ingests, before the playback clock applies pause,
+speed, or seek controls. Replay feeds those values back through the ordinary UI
+snapshot path; its only special policy is retaining the complete finite timeline.
 
 **Animation state is separate from cluster state.** `anim.Registry` holds what
 the *screen* is doing; `model.Snapshot` holds what the *cluster* is doing. A

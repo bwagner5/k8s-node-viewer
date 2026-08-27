@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -241,6 +242,9 @@ func (m *Model) renderStatus(w int) string {
 	if m.zoom != 0 && m.mode != ModeDense {
 		left = append(left, "zoom:"+zoomLabel(m.lay.scale))
 	}
+	if m.recordingActive() {
+		left = append(left, "REC:"+filepath.Base(m.recording.Path()))
+	}
 	left = append(left, playbackStatus(m.playback, time.Now()))
 	left = append(left, m.filter.Describe()...)
 	if !m.filter.Active() {
@@ -300,6 +304,25 @@ func playbackStatus(p *playback, wallNow time.Time) string {
 	if p.speed == 0 {
 		state = "PAUSED"
 	}
+	if p.archive {
+		start, end := displayAt, displayAt
+		if len(p.history) > 0 {
+			start = snapshotTime(p.history[0], displayAt).Local()
+		}
+		if p.latest != nil {
+			end = p.timelineEnd(displayAt).Local()
+		}
+		position := displayAt.Sub(start)
+		duration := end.Sub(start)
+		if position < 0 {
+			position = 0
+		}
+		if position > duration {
+			position = duration
+		}
+		return fmt.Sprintf("REPLAY %s · at %s · %s / %s", state, stamp,
+			playbackLag(position), playbackLag(duration))
+	}
 	return fmt.Sprintf("%s · at %s · %s behind", state, stamp, playbackLag(p.Behind(wallNow)))
 }
 
@@ -311,7 +334,7 @@ func playbackLag(d time.Duration) string {
 }
 
 func (m *Model) showSeekOverlay(moved time.Duration) {
-	if moved <= 0 {
+	if moved == 0 {
 		return
 	}
 	now := time.Now()
@@ -327,19 +350,25 @@ func (m *Model) showSeekOverlay(moved time.Duration) {
 // already-rendered frame. ansi.Cut preserves the styling on either side while
 // replacing only the centred panel's cells, so frame geometry never changes.
 func (m *Model) renderSeekOverlay(frame string, w, h int) string {
-	if m.seekOverlay <= 0 || m.seekOverlayAt.IsZero() ||
+	if m.seekOverlay == 0 || m.seekOverlayAt.IsZero() ||
 		time.Since(m.seekOverlayAt) >= seekOverlayTTL || w < 8 || h < 3 {
 		return frame
 	}
-	seconds := m.seekOverlay.Seconds()
+	direction := "−"
+	distance := m.seekOverlay
+	if distance < 0 {
+		direction = "+"
+		distance = -distance
+	}
+	seconds := distance.Seconds()
 	var amount string
-	if m.seekOverlay%time.Second == 0 {
-		amount = fmt.Sprintf("− %d seconds", int64(seconds))
+	if distance%time.Second == 0 {
+		amount = fmt.Sprintf("%s %d seconds", direction, int64(seconds))
 	} else {
-		amount = fmt.Sprintf("− %.1f seconds", seconds)
+		amount = fmt.Sprintf("%s %.1f seconds", direction, seconds)
 	}
 	if seconds == 1 {
-		amount = "− 1 second"
+		amount = direction + " 1 second"
 	}
 
 	t := theme.Current
@@ -478,8 +507,9 @@ func helpLines(includeDemo bool) []string {
 		"  s / S         cycle sort / reverse",
 		"  l             toggle legend           ?        this help",
 		"  z / Z         zoom in / out           0        zoom to fit",
-		"  p             pause / resume          [        rewind 5 seconds",
-		"                                        r        jump to realtime",
+		"  p             pause / resume          [ / ]    back / forward 5 seconds",
+		"  R             start / stop recording",
+		"                                        r        jump to realtime / replay end",
 		"  q             quit",
 		"",
 		"MOUSE / TRACKPAD",

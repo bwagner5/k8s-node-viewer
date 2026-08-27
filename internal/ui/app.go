@@ -53,13 +53,36 @@ type Config struct {
 	// presentation-friendly defaults.
 	HistoryDuration time.Duration
 	HistoryMemory   int64
-	Mode            Mode
-	Sort            SortKey
-	Filter          Filter
-	Legend          bool
+	// Replay selects finite archival playback. Its complete source timeline is
+	// retained without the live rolling-window limits.
+	Replay bool
+	// ReplayEnd includes idle time after the last changed snapshot in a cleanly
+	// closed recording.
+	ReplayEnd time.Time
+	// CaptureDetails makes the UI sample every node even in realtime. Recording
+	// uses it so the session contains historical events whether or not a detail
+	// pane happened to be open.
+	CaptureDetails bool
+	// Recording provides runtime start/stop control. It is nil for replay.
+	Recording     RecordingController
+	DetailHistory []RecordedDetail
+	Mode          Mode
+	Sort          SortKey
+	Filter        Filter
+	Legend        bool
 	// Describe backs the node detail pane. Nil degrades the pane to snapshot
 	// data with a note that events need a source, rather than disabling it.
 	Describe Describer
+}
+
+// RecordedDetail is a node-detail sample loaded alongside archived snapshots.
+type RecordedDetail struct {
+	At         time.Time
+	Identity   string
+	Name       string
+	NodeClaim  string
+	ProviderID string
+	Detail     *model.NodeDetail
 }
 
 // Model is the bubbletea model.
@@ -123,6 +146,7 @@ type Model struct {
 	// lastMouse is the most recent mouse event, kept only for the debug readout.
 	lastMouse string
 	demo      Demo
+	recording RecordingController
 
 	bar    cmdBar
 	msg    string
@@ -166,7 +190,7 @@ func New(cfg Config) *Model {
 		// paused is available through :speed 0 once the program is running.
 		initialSpeed = 1
 	}
-	return &Model{
+	m := &Model{
 		cfg:           cfg,
 		snaps:         cfg.Snapshots,
 		snap:          &model.Snapshot{},
@@ -178,11 +202,45 @@ func New(cfg Config) *Model {
 		filter:        cfg.Filter,
 		showLegend:    cfg.Legend,
 		demo:          cfg.Demo,
+		recording:     cfg.Recording,
 		describe:      cfg.Describe,
-		playback:      newPlayback(initialSpeed, cfg.HistoryDuration, cfg.HistoryMemory),
+		playback:      newPlaybackMode(initialSpeed, cfg.HistoryDuration, cfg.HistoryMemory, cfg.Replay),
 		detailHistory: map[string][]detailSample{},
 		last:          time.Now(),
 	}
+	m.playback.archiveEnd = cfg.ReplayEnd
+	for _, loaded := range cfg.DetailHistory {
+		if loaded.Detail == nil {
+			continue
+		}
+		sample := detailSample{at: loaded.At, detail: loaded.Detail, bytes: estimateDetailBytes(loaded.Detail)}
+		identities := []string{loaded.Identity, detailIdentity(loaded.Name, loaded.NodeClaim, loaded.ProviderID)}
+		if loaded.ProviderID != "" {
+			identities = append(identities, "provider:"+loaded.ProviderID)
+		}
+		if loaded.NodeClaim != "" {
+			identities = append(identities, "claim:"+loaded.NodeClaim)
+		}
+		if loaded.Name != "" {
+			identities = append(identities, "node:"+loaded.Name)
+		}
+		seen := map[string]bool{}
+		for _, identity := range identities {
+			if identity == "" || seen[identity] {
+				continue
+			}
+			seen[identity] = true
+			m.detailHistory[identity] = append(m.detailHistory[identity], sample)
+		}
+		// Aliases point at the same payload and do not multiply retained bytes.
+		m.detailHistoryBytes += sample.bytes
+	}
+	for identity := range m.detailHistory {
+		sort.SliceStable(m.detailHistory[identity], func(i, j int) bool {
+			return m.detailHistory[identity][i].at.Before(m.detailHistory[identity][j].at)
+		})
+	}
+	return m
 }
 
 // debugMouse turns on a live readout of what the terminal reports and what the
@@ -216,7 +274,7 @@ func (m *Model) trace(kind, detail string) {
 	}
 	f := m.layoutFrame()
 	fmt.Fprintf(traceFile, "%-6s %-42s | grid@%d+%d cols=%d box=%dx%d pan=%d,%d zoom=%d accum=%d cur=%d(%s) anchor=%s\n",
-		kind, detail, f.header+f.legend, f.grid, m.lay.cols, m.lay.boxW, m.lay.boxH,
+		kind, detail, f.gridTop(), f.grid, m.lay.cols, m.lay.boxW, m.lay.boxH,
 		m.panX, m.panY, m.zoom, m.wheelAccum, m.cursor, m.cursorName, m.anchorName)
 }
 
@@ -432,12 +490,15 @@ func (m *Model) derive() {
 // here and nowhere else, so View cannot produce a frame that is not exactly m.h
 // rows tall — an invariant bubbletea's renderer depends on.
 type frame struct {
-	header, legend, bar, grid, status int
+	header, action, legend, bar, grid, status int
 }
 
+func (f frame) gridTop() int { return f.header + f.action + f.legend }
+
 // layoutFrame allocates rows, shedding chrome as the terminal shrinks. Order of
-// sacrifice: legend, then header. The status line and at least one grid row
-// always survive, because a screen with no grid and no status says nothing.
+// sacrifice: legend, then header, then the active-action ribbon. The status line
+// and at least one grid row always survive, because a screen with no grid and no
+// status says nothing.
 func (m *Model) layoutFrame() frame {
 	var f frame
 	h := m.h
@@ -450,8 +511,11 @@ func (m *Model) layoutFrame() frame {
 	if m.showLegend && h >= 14 {
 		f.legend = legendHeight
 	}
+	if h >= 4 && len(detectConsolidations(m.snap, m.displayNow()).actions) > 0 {
+		f.action = 1
+	}
 
-	rest := h - f.status - f.header - f.legend
+	rest := h - f.status - f.gridTop()
 	f.bar = min(m.bar.height(), max(0, rest-1))
 	f.grid = max(0, rest-f.bar)
 	return f
@@ -598,7 +662,7 @@ func (m *Model) zoomBy(delta int) {
 // under it stays under it. This is what makes the gesture aimable.
 func (m *Model) zoomAtPointer(delta, x, y int) {
 	f := m.layoutFrame()
-	gridY := y - f.header - f.legend
+	gridY := y - f.gridTop()
 
 	// Where in the anchored card the pointer is, as a fraction of the card. The
 	// same fraction of the resized card goes back under the same pixel, which is
@@ -829,6 +893,24 @@ func (m *Model) rewindPlayback(amount time.Duration) (tea.Cmd, time.Duration) {
 	return cmd, moved
 }
 
+func (m *Model) forwardPlayback(amount time.Duration) (tea.Cmd, time.Duration) {
+	snap, moved := m.playback.Forward(amount, time.Now())
+	if moved <= 0 {
+		return nil, 0
+	}
+	if snap == nil {
+		m.refreshHistoricalDetail()
+		return nil, moved
+	}
+	// Like rewind, an explicit forward seek lands atomically.
+	m.reg = anim.NewRegistry()
+	m.fleet = &anim.Track{}
+	m.pend = &anim.Track{}
+	cmd := m.applySnapshot(snap)
+	m.reg.Advance(anim.ExitDur)
+	return cmd, moved
+}
+
 // goRealtime is the one operation that discards history. Setting speed to 1x
 // intentionally does not call it: that plays forward normally from the current
 // delayed frame and keeps the existing lag.
@@ -836,8 +918,10 @@ func (m *Model) goRealtime(message string) tea.Cmd {
 	wasLive := m.playback.live
 	now := time.Now()
 	snap := m.playback.GoLive(now)
-	m.clearDetailHistory()
-	m.detailHistoryExhausted = false
+	if !m.playback.archive {
+		m.clearDetailHistory()
+		m.detailHistoryExhausted = false
+	}
 	if message == "" {
 		message = playbackStatus(m.playback, now)
 	}
@@ -871,16 +955,17 @@ func (m *Model) View() string {
 		return m.renderSeekOverlay(m.renderHelp(m.w, m.h), m.w, m.h)
 	}
 
-	ctx := boxCtx{
-		reg:  m.reg,
-		mode: m.mode,
-		now:  m.displayNow(),
-	}
+	now := m.displayNow()
+	actions := detectConsolidations(m.snap, now)
+	ctx := boxCtx{reg: m.reg, mode: m.mode, now: now, actions: actions.members}
 
 	f := m.layoutFrame()
 	var lines []string
 	if f.header > 0 {
 		lines = append(lines, strings.Split(m.renderHeader(m.w), "\n")...)
+	}
+	if f.action > 0 {
+		lines = append(lines, renderConsolidationRibbon(m.w, actions))
 	}
 	if f.legend > 0 {
 		lines = append(lines, strings.Split(m.renderLegend(m.w), "\n")...)

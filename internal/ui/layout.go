@@ -332,7 +332,7 @@ func renderDense(vs []visible, w, h int, ctx boxCtx, scroll, cursor int) string 
 	}
 	c := newCanvas(w, h, t.Bg, t.Fg)
 
-	cols := denseColumns(w)
+	cols := denseColumnsFor(w, len(ctx.actions) > 0)
 
 	c.text(1, 0, "NODE", t.Dim, true)
 	if cols.showType {
@@ -345,6 +345,9 @@ func renderDense(vs []visible, w, h int, ctx boxCtx, scroll, cursor int) string 
 	c.text(cols.xMem, 0, "MEM", t.Dim, true)
 	if cols.showCons {
 		c.text(cols.xCons, 0, "CONS", t.Dim, true)
+	}
+	if cols.showAction {
+		c.text(cols.xAction, 0, "ACTION", t.Dim, true)
 	}
 	c.text(cols.xTail, 0, "PODS  AGE", t.Dim, true)
 	if cols.showState {
@@ -378,7 +381,7 @@ func renderDense(vs []visible, w, h int, ctx boxCtx, scroll, cursor int) string 
 			fg = t.Dimmed(fg, track.ExitEase())
 		}
 
-		c.text(0, y, "▌", phaseCol, true)
+		c.text(0, y, "┃", phaseCol, true)
 		c.text(1, y, shorten(n.Name, cols.nameW), fg, i+scroll == cursor)
 		if cols.showType {
 			c.text(cols.xType, y, shorten(n.InstanceType, 14), t.Dim, false)
@@ -397,6 +400,17 @@ func renderDense(vs []visible, w, h int, ctx boxCtx, scroll, cursor int) string 
 			// The column is one glyph wide, so it has to carry its meaning in colour
 			// as well: a consolidatable node is one Karpenter may take away.
 			c.text(cols.xCons+1, y, n.Consolidatable.Short(), consolidationColor(n.Consolidatable), true)
+		}
+		if cols.showAction {
+			if member, ok := ctx.actions[n.Name]; ok {
+				direction := "↓"
+				if member.role == consolidationIncoming {
+					direction = "↑"
+				}
+				c.text(cols.xAction, y, member.id+" "+consolidationKindCode(member.kind)+direction, t.Accent, true)
+			} else {
+				c.text(cols.xAction+1, y, "·", t.Dim, false)
+			}
 		}
 
 		tail := fmt.Sprintf("%4d %4s", len(v.pods), model.HumanAge(ctx.now.Sub(n.Created)))
@@ -425,9 +439,9 @@ func consolidationColor(c model.Consolidation) lipgloss.Color {
 
 // denseCols is the resolved column geometry for one terminal width.
 type denseCols struct {
-	nameW, meterW                           int
-	xType, xPool, xCPU, xMem, xCons, xTail  int
-	showType, showPool, showState, showCons bool
+	nameW, meterW                                       int
+	xType, xPool, xCPU, xMem, xCons, xAction, xTail     int
+	showType, showPool, showState, showCons, showAction bool
 }
 
 const denseStateWidth = 20
@@ -436,6 +450,10 @@ const denseStateWidth = 20
 // first as width shrinks, rather than letting everything overlap. The node name
 // and the two meters are never dropped: they are the reason to be in this mode.
 func denseColumns(w int) denseCols {
+	return denseColumnsFor(w, false)
+}
+
+func denseColumnsFor(w int, action bool) denseCols {
 	const (
 		minName  = 12
 		typeW    = 15
@@ -444,8 +462,9 @@ func denseColumns(w int) denseCols {
 		podsAgeW = 10
 		stateW   = denseStateWidth
 		consW    = 5
+		actionW  = 9
 	)
-	d := denseCols{showType: true, showPool: true, showState: true, showCons: true}
+	d := denseCols{showType: true, showPool: true, showState: true, showCons: true, showAction: action}
 	d.meterW = clampInt((w-75)/2, 5, 20)
 
 	// Give up columns in increasing order of value until the name fits.
@@ -462,6 +481,9 @@ func denseColumns(w int) denseCols {
 		}
 		if d.showCons {
 			fixed += consW
+		}
+		if d.showAction {
+			fixed += actionW
 		}
 		d.nameW = w - fixed
 		if d.nameW >= minName {
@@ -480,6 +502,10 @@ func denseColumns(w int) denseCols {
 			// State is the reason to look at a live demo. It disappears only after
 			// every secondary descriptor and all optional meter width are gone.
 			d.showState = false
+		case d.showAction:
+			// An active relationship outlives every secondary descriptor. Only the
+			// node identity and its two core meters survive narrower terminals.
+			d.showAction = false
 		default:
 			d.nameW = max(4, d.nameW)
 			goto done
@@ -510,6 +536,10 @@ done:
 	if d.showCons {
 		d.xCons = x
 		x += consW
+	}
+	if d.showAction {
+		d.xAction = x
+		x += actionW
 	}
 	d.xTail = x
 	return d

@@ -120,6 +120,9 @@ func (s *Store) UpsertNode(n *Node) {
 		if n.ProviderID == "" {
 			n.ProviderID = prev.ProviderID
 		}
+		if n.DisruptionReason == "" {
+			n.DisruptionReason = prev.DisruptionReason
+		}
 		n.Created = earliest(prev.Created, n.Created)
 		n.Transitions = append([]PhaseTransition(nil), prev.Transitions...)
 		recordPhaseTransition(n, n.Phase, now)
@@ -146,6 +149,9 @@ func (s *Store) UpsertNode(n *Node) {
 		}
 		if n.NodePool == "" {
 			n.NodePool = c.NodePool
+		}
+		if n.DisruptionReason == "" {
+			n.DisruptionReason = c.DisruptionReason
 		}
 		// The claim is older than its Node — Karpenter creates it, then waits for
 		// the instance to boot and kubelet to register, which is where the Node's
@@ -364,6 +370,9 @@ func (s *Store) UpsertClaim(claimName string, placeholder *Node) {
 		if n.NodePool == "" {
 			n.NodePool = placeholder.NodePool
 		}
+		// The condition is transient, so an empty value is meaningful: Karpenter
+		// cleared the action and the real node must not retain a stale reason.
+		n.DisruptionReason = placeholder.DisruptionReason
 		n.Created = earliest(placeholder.Created, n.Created)
 		adopted = true
 	}

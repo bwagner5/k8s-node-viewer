@@ -19,6 +19,7 @@ import (
 	"k8s.io/klog/v2"
 
 	"github.com/oxidecomputer/k8s-node-viewer/internal/model"
+	"github.com/oxidecomputer/k8s-node-viewer/internal/session"
 	"github.com/oxidecomputer/k8s-node-viewer/internal/source/fake"
 	"github.com/oxidecomputer/k8s-node-viewer/internal/source/kube"
 	"github.com/oxidecomputer/k8s-node-viewer/internal/theme"
@@ -44,6 +45,8 @@ type flags struct {
 	playbackSpeed    float64
 	historyDuration  time.Duration
 	historyMemoryMiB int64
+	recordFile       string
+	replayFile       string
 	legend           bool
 
 	demo      bool
@@ -73,9 +76,11 @@ func run() error {
 	pflag.IntVar(&f.fps, "fps", 20, "animation frame rate")
 	pflag.DurationVar(&f.metricsRate, "metrics-interval", 5*time.Second, "how often to poll metrics.k8s.io")
 	pflag.StringVar(&f.priceAnnotation, "price-annotation", kube.DefaultPriceAnnotation, "annotation containing a node or NodeClaim's numeric hourly price")
-	pflag.Float64Var(&f.playbackSpeed, "playback-speed", 1, "initial cluster playback speed from 0 (paused) to 1 (realtime)")
+	pflag.Float64Var(&f.playbackSpeed, "playback-speed", 1, "initial timeline speed (live: 0-1; replay: 0-16)")
 	pflag.DurationVar(&f.historyDuration, "history-duration", 10*time.Minute, "maximum buffered playback history")
 	pflag.Int64Var(&f.historyMemoryMiB, "history-memory", 256, "approximate playback history memory limit in MiB")
+	pflag.StringVar(&f.recordFile, "record", "", "record the source timeline to a new .knv or .knv.gz file")
+	pflag.StringVar(&f.replayFile, "replay", "", "load and replay a recorded .knv or .knv.gz session")
 	pflag.BoolVar(&f.legend, "legend", true, "show the colour legend")
 
 	pflag.BoolVar(&f.demo, "demo", false, "run against a simulated cluster instead of a real one")
@@ -111,9 +116,32 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	cfg.Snapshots = src.store.Watch(ctx, snapshotInterval)
+	var snapshots <-chan *model.Snapshot
+	if src.snapshots != nil {
+		snapshots = src.snapshots
+	} else {
+		snapshots = src.store.Watch(ctx, snapshotInterval)
+	}
+
+	var recording *session.Manager
+	if !src.replay {
+		recording = session.NewManager()
+		if f.recordFile != "" {
+			if _, err := recording.Start(f.recordFile, nil); err != nil {
+				return err
+			}
+		}
+		snapshots = recording.WrapSnapshots(ctx, snapshots)
+		src.describe = recording.WrapDescriber(src.describe)
+		cfg.CaptureDetails = true
+		cfg.Recording = recording
+	}
+	cfg.Snapshots = snapshots
 	cfg.Demo = src.demo
 	cfg.Describe = src.describe
+	cfg.Replay = src.replay
+	cfg.ReplayEnd = src.replayEnd
+	cfg.DetailHistory = src.details
 	runSource := src.run
 
 	// The source runs alongside the UI; a source failure should tear the UI down
@@ -126,6 +154,15 @@ func run() error {
 	uiErr := ui.Run(ctx, cfg)
 	cancelSource()
 
+	if recording != nil {
+		paths, closeErr := recording.Close()
+		for _, path := range paths {
+			fmt.Fprintf(os.Stdout, "recording saved to %s\n", path)
+		}
+		if closeErr != nil && (uiErr == nil || errors.Is(uiErr, context.Canceled)) {
+			uiErr = closeErr
+		}
+	}
 	if uiErr != nil && !errors.Is(uiErr, context.Canceled) {
 		return uiErr
 	}
@@ -154,8 +191,15 @@ func run() error {
 func silenceClientGoLogging() { klog.SetLogger(logr.Discard()) }
 
 func buildConfig(f *flags) (ui.Config, error) {
-	if f.playbackSpeed < 0 || f.playbackSpeed > 1 {
-		return ui.Config{}, fmt.Errorf("--playback-speed must be between 0 and 1")
+	if f.recordFile != "" && f.replayFile != "" {
+		return ui.Config{}, fmt.Errorf("--record and --replay cannot be used together")
+	}
+	maxSpeed := float64(1)
+	if f.replayFile != "" {
+		maxSpeed = 16
+	}
+	if f.playbackSpeed < 0 || f.playbackSpeed > maxSpeed {
+		return ui.Config{}, fmt.Errorf("--playback-speed must be between 0 and %g", maxSpeed)
 	}
 	if f.historyDuration <= 0 {
 		return ui.Config{}, fmt.Errorf("--history-duration must be positive")
@@ -189,8 +233,12 @@ func buildConfig(f *flags) (ui.Config, error) {
 // Bundling them keeps the wiring one assignment per capability instead of a
 // five-value return that has to be read against its signature.
 type source struct {
-	store *model.Store
-	run   func(context.Context) error
+	store     *model.Store
+	snapshots <-chan *model.Snapshot
+	run       func(context.Context) error
+	replay    bool
+	replayEnd time.Time
+	details   []ui.RecordedDetail
 	// demo is nil against a real cluster: the viewer never mutates one.
 	demo ui.Demo
 	// describe backs the node detail pane. Both sources provide it — reading a
@@ -200,6 +248,24 @@ type source struct {
 
 // startSource builds either the live or simulated source.
 func startSource(ctx context.Context, f *flags) (*source, error) {
+	if f.replayFile != "" {
+		loaded, err := session.Load(f.replayFile)
+		if err != nil {
+			return nil, err
+		}
+		details := make([]ui.RecordedDetail, 0, len(loaded.Details))
+		for _, detail := range loaded.Details {
+			details = append(details, ui.RecordedDetail{At: detail.At, Identity: detail.Identity,
+				Name: detail.Name, NodeClaim: detail.NodeClaim, ProviderID: detail.ProviderID, Detail: detail.Detail})
+		}
+		return &source{
+			snapshots: session.Stream(ctx, loaded.Snapshots),
+			run:       func(runCtx context.Context) error { <-runCtx.Done(); return nil },
+			replay:    true,
+			replayEnd: loaded.EndedAt,
+			details:   details,
+		}, nil
+	}
 	if f.demo {
 		cluster, store := fake.New(fake.Options{
 			Nodes:     f.demoNodes,

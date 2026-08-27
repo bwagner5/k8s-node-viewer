@@ -44,7 +44,9 @@ type detailHistoryMsg struct {
 // uses the existing bounded Describe path and a small worker pool, so a twenty
 // node demo does not become a twenty-request burst against the API server.
 func (m *Model) captureDetailHistory(now time.Time) tea.Cmd {
-	if m.playback.live || m.describe == nil || m.detailHistoryExhausted || m.detailCapturing ||
+	captureDetails := m.cfg.CaptureDetails && (m.cfg.Recording == nil || m.recordingActive())
+	if (m.playback.live && !captureDetails) || m.describe == nil ||
+		(m.detailHistoryExhausted && !captureDetails) || m.detailCapturing ||
 		(!m.detailCaptureAt.IsZero() && now.Sub(m.detailCaptureAt) < detailHistoryInterval) {
 		return nil
 	}
@@ -106,12 +108,17 @@ func (m *Model) captureDetailHistory(now time.Time) tea.Cmd {
 }
 
 func (m *Model) applyDetailHistory(msg detailHistoryMsg) {
-	if m.playback.live || msg.epoch != m.detailHistoryEpoch {
+	m.detailCapturing = false
+	if msg.epoch != m.detailHistoryEpoch || m.playback.live {
 		return
 	}
-	m.detailCapturing = false
 	for _, result := range msg.results {
 		if result.err != nil || result.detail == nil {
+			continue
+		}
+		if m.detailHistoryExhausted {
+			// A recording wrapper has already persisted the result. Keep sampling
+			// for the file without trying to grow the exhausted UI buffer.
 			continue
 		}
 		model.SortEvents(result.detail.Events)
@@ -172,6 +179,9 @@ func (m *Model) refreshHistoricalDetail() {
 }
 
 func (m *Model) pruneDetailHistory() {
+	if m.playback.archive {
+		return
+	}
 	cutoff := m.displayNow()
 	for identity, history := range m.detailHistory {
 		keep := 0

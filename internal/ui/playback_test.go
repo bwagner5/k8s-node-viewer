@@ -197,3 +197,59 @@ func TestPlaybackRejectsUnsupportedSpeeds(t *testing.T) {
 		}
 	}
 }
+
+func TestArchivedPlaybackKeepsFullHistoryAndSeeksBothDirections(t *testing.T) {
+	start := time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC)
+	p := newPlaybackMode(0, time.Second, 1, true)
+	p.archiveEnd = start.Add(5 * time.Minute)
+	for i := 0; i < 5; i++ {
+		at := start.Add(time.Duration(i) * time.Minute)
+		p.Ingest(playbackSnapshot(uint64(i+1), at), at)
+	}
+	if p.OverLimit(start.Add(24 * time.Hour)) {
+		t.Fatal("archived playback obeyed live history limits")
+	}
+	if snap, moved := p.Forward(10*time.Minute, start); snap == nil || snap.Generation != 5 || moved != 5*time.Minute {
+		t.Fatalf("forward to end = snapshot %#v moved %s", snap, moved)
+	}
+	if snap, moved := p.Rewind(10*time.Minute, start); snap == nil || snap.Generation != 1 || moved != 5*time.Minute {
+		t.Fatalf("rewind to beginning = snapshot %#v moved %s", snap, moved)
+	}
+	if got := snapshotGenerations(p.history); len(got) != 1 || got[0] != 1 {
+		t.Fatalf("history after full rewind = %v", got)
+	}
+	if got := snapshotGenerations(p.queue); len(got) != 4 || got[3] != 5 {
+		t.Fatalf("queue after full rewind = %v", got)
+	}
+}
+
+func TestArchivedPlaybackSupportsFastSpeedAndEndJump(t *testing.T) {
+	start := time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC)
+	p := newPlaybackMode(1, time.Second, 1, true)
+	p.Ingest(playbackSnapshot(1, start), start)
+	p.Ingest(playbackSnapshot(2, start.Add(8*time.Second)), start)
+	if err := p.SetSpeed(8, start); err != nil {
+		t.Fatal(err)
+	}
+	if got := p.Advance(time.Second, start.Add(time.Second)); len(got) != 1 || got[0].Generation != 2 {
+		t.Fatalf("8x replay released %v", snapshotGenerations(got))
+	}
+	p.Rewind(8*time.Second, start)
+	if got := p.GoLive(start.Add(time.Hour)); got == nil || got.Generation != 2 || len(p.queue) != 0 || len(p.history) != 2 {
+		t.Fatalf("archive end jump = %#v history=%v queue=%v", got,
+			snapshotGenerations(p.history), snapshotGenerations(p.queue))
+	}
+}
+
+func TestArchivedPlaybackIncludesIdleTail(t *testing.T) {
+	start := time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC)
+	p := newPlaybackMode(1, time.Second, 1, true)
+	p.archiveEnd = start.Add(time.Minute)
+	p.Ingest(playbackSnapshot(1, start), start)
+	if got := p.Advance(30*time.Second, start.Add(30*time.Second)); len(got) != 0 || p.now != start.Add(30*time.Second) {
+		t.Fatalf("idle archive advanced to %s and released %v", p.now, got)
+	}
+	if snap, moved := p.Forward(time.Hour, start); snap != nil || moved != 30*time.Second || p.now != p.archiveEnd {
+		t.Fatalf("idle tail seek = snapshot %#v moved %s now %s", snap, moved, p.now)
+	}
+}

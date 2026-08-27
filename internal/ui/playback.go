@@ -22,6 +22,8 @@ const (
 // seconds behind the cluster. Only GoLive discards that history and catches up.
 type playback struct {
 	live        bool
+	archive     bool
+	archiveEnd  time.Time
 	speed       float64
 	resumeSpeed float64
 	now         time.Time
@@ -34,13 +36,26 @@ type playback struct {
 }
 
 func newPlayback(initialSpeed float64, maxAge time.Duration, maxBytes int64) *playback {
+	return newPlaybackMode(initialSpeed, maxAge, maxBytes, false)
+}
+
+func newPlaybackMode(initialSpeed float64, maxAge time.Duration, maxBytes int64, archive bool) *playback {
 	if maxAge <= 0 {
 		maxAge = defaultHistoryDuration
 	}
 	if maxBytes <= 0 {
 		maxBytes = defaultHistoryMemory
 	}
-	p := &playback{live: true, speed: 1, resumeSpeed: 1, maxAge: maxAge, maxBytes: maxBytes}
+	p := &playback{live: !archive, archive: archive, speed: 1, resumeSpeed: 1, maxAge: maxAge, maxBytes: maxBytes}
+	if archive {
+		if initialSpeed >= 0 && initialSpeed <= 16 {
+			p.speed = initialSpeed
+			if initialSpeed > 0 {
+				p.resumeSpeed = initialSpeed
+			}
+		}
+		return p
+	}
 	if initialSpeed >= 0 && initialSpeed < 1 {
 		p.live = false
 		p.speed = initialSpeed
@@ -85,8 +100,14 @@ func (p *playback) Advance(wallDT time.Duration, wallNow time.Time) []*model.Sna
 	}
 	if wallDT > 0 && p.speed > 0 {
 		p.now = p.now.Add(time.Duration(float64(wallDT) * p.speed))
-		if p.now.After(wallNow) {
+		if !p.archive && p.now.After(wallNow) {
 			p.now = wallNow
+		}
+		if p.archive && p.latest != nil {
+			end := p.timelineEnd(p.now)
+			if p.now.After(end) {
+				p.now = end
+			}
 		}
 	}
 
@@ -149,6 +170,38 @@ func (p *playback) Rewind(amount time.Duration, wallNow time.Time) (*model.Snaps
 	return p.history[target], from.Sub(targetTime)
 }
 
+// Forward seeks toward the freshest buffered snapshot without changing the
+// current rate or pause state. It returns the newest crossed snapshot; a seek is
+// applied atomically by the UI rather than animating every intermediate frame.
+func (p *playback) Forward(amount time.Duration, wallNow time.Time) (*model.Snapshot, time.Duration) {
+	if amount <= 0 || p.live || p.latest == nil {
+		return nil, 0
+	}
+	from := p.DisplayNow(wallNow)
+	end := p.timelineEnd(from)
+	if !end.After(from) {
+		return nil, 0
+	}
+	targetTime := from.Add(amount)
+	if targetTime.After(end) {
+		targetTime = end
+	}
+	n := 0
+	for n < len(p.queue) && !snapshotTime(p.queue[n], wallNow).After(targetTime) {
+		n++
+	}
+	var target *model.Snapshot
+	if n > 0 {
+		target = p.queue[n-1]
+		p.history = append(p.history, p.queue[:n]...)
+		copy(p.queue, p.queue[n:])
+		p.queue = p.queue[:len(p.queue)-n]
+		p.pruneHistory(wallNow)
+	}
+	p.now = targetTime
+	return target, targetTime.Sub(from)
+}
+
 // remember retains a displayed snapshot in the short rolling rewind window.
 func (p *playback) remember(snap *model.Snapshot, wallNow time.Time) {
 	if snap == nil {
@@ -160,7 +213,7 @@ func (p *playback) remember(snap *model.Snapshot, wallNow time.Time) {
 }
 
 func (p *playback) pruneHistory(wallNow time.Time) {
-	if len(p.history) == 0 {
+	if len(p.history) == 0 || p.archive {
 		return
 	}
 	window := defaultRewindDuration
@@ -198,8 +251,12 @@ func (p *playback) pruneHistory(wallNow time.Time) {
 // SetSpeed changes playback rate without changing its current position. A 1x
 // delayed stream therefore stays delayed. Use GoLive for the catch-up action.
 func (p *playback) SetSpeed(speed float64, wallNow time.Time) error {
-	if math.IsNaN(speed) || math.IsInf(speed, 0) || speed < 0 || speed > 1 {
-		return fmt.Errorf("speed must be between 0x and 1x")
+	maxSpeed := float64(1)
+	if p.archive {
+		maxSpeed = 16
+	}
+	if math.IsNaN(speed) || math.IsInf(speed, 0) || speed < 0 || speed > maxSpeed {
+		return fmt.Errorf("speed must be between 0x and %gx", maxSpeed)
 	}
 	if p.live {
 		p.live = false
@@ -236,6 +293,12 @@ func (p *playback) TogglePause(wallNow time.Time) {
 // cluster would have no rewind history until its next change.
 func (p *playback) GoLive(wallNow time.Time) *model.Snapshot {
 	latest := p.latest
+	if p.archive {
+		p.history = append(p.history, p.queue...)
+		p.queue = nil
+		p.now = p.timelineEnd(p.now)
+		return latest
+	}
 	p.live, p.speed, p.resumeSpeed = true, 1, 1
 	p.now = wallNow
 	p.history = nil
@@ -267,7 +330,7 @@ func (p *playback) Behind(wallNow time.Time) time.Duration {
 }
 
 func (p *playback) OverLimit(wallNow time.Time) bool {
-	return !p.live && ((p.maxAge > 0 && p.Behind(wallNow) > p.maxAge) ||
+	return !p.archive && !p.live && ((p.maxAge > 0 && p.Behind(wallNow) > p.maxAge) ||
 		(p.maxBytes > 0 && p.bytes > p.maxBytes))
 }
 
@@ -276,6 +339,20 @@ func snapshotTime(snap *model.Snapshot, fallback time.Time) time.Time {
 		return fallback
 	}
 	return snap.Taken
+}
+
+func (p *playback) timelineEnd(fallback time.Time) time.Time {
+	end := p.archiveEnd
+	if p.latest != nil {
+		latest := snapshotTime(p.latest, fallback)
+		if end.IsZero() || latest.After(end) {
+			end = latest
+		}
+	}
+	if end.IsZero() {
+		return fallback
+	}
+	return end
 }
 
 // estimateSnapshotBytes is intentionally conservative rather than pretending
@@ -297,7 +374,7 @@ func estimateSnapshotBytes(s *model.Snapshot) int64 {
 		n += int64(len(node.Transitions) * 32)
 		n += stringBytes(node.Name, node.InstanceType, node.Zone, node.Region, node.Arch,
 			node.CapacityType, node.NodePool, node.NodeClaim, node.ProviderID, node.Message,
-			node.ConsolidationReason)
+			node.ConsolidationReason, node.DisruptionReason)
 		for k, v := range node.Labels {
 			n += int64(48 + len(k) + len(v))
 		}

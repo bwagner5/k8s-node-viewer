@@ -134,6 +134,50 @@ func TestDelayedDetailUsesHistoryOrLabelsLiveFallback(t *testing.T) {
 	}
 }
 
+func TestReplayPreloadsHistoricalDetailUnderHandoverAliases(t *testing.T) {
+	snap := testSnapshot(1)
+	at := time.Now().Add(-time.Minute)
+	snap.Taken = at
+	n := snap.Nodes[0]
+	n.NodeClaim = "claim-a"
+	n.ProviderID = "cloud:///i-1"
+	detail := sampleDetail(n.Name)
+	detail.FetchedAt, detail.ProviderID = at, n.ProviderID
+	m := New(Config{Replay: true, PlaybackSet: true, PlaybackSpeed: 0,
+		DetailHistory: []RecordedDetail{{At: at, Name: n.Name, NodeClaim: n.NodeClaim,
+			ProviderID: n.ProviderID, Detail: detail}}})
+	m.w, m.h = 120, 40
+	m.playback.Ingest(snap, at)
+	m.applySnapshot(snap)
+	if cmd := m.openDetail(); cmd != nil {
+		t.Fatal("recorded detail issued a source fetch")
+	}
+	if m.detail == nil || !m.detail.historical || m.detail.detail != detail {
+		t.Fatalf("recorded detail was not loaded: %#v", m.detail)
+	}
+	if _, _, ok := m.historicalDetail(n.Name, "", ""); !ok {
+		t.Fatal("node-name alias did not resolve recorded detail")
+	}
+}
+
+func TestRecordingCaptureSamplesDetailWhileRealtime(t *testing.T) {
+	describer := &stubDescriber{detail: sampleDetail("")}
+	m := New(Config{CaptureDetails: true, Describe: describer})
+	snap := testSnapshot(1)
+	m.playback.Ingest(snap, time.Now())
+	cmd := m.captureDetailHistory(time.Now())
+	if cmd == nil {
+		t.Fatal("recording did not sample detail while realtime")
+	}
+	m.Update(cmd())
+	if describer.calls != 1 || m.detailCapturing {
+		t.Fatalf("detail capture calls=%d capturing=%v", describer.calls, m.detailCapturing)
+	}
+	if len(m.detailHistory) != 0 {
+		t.Fatal("realtime recording sample unnecessarily grew playback detail history")
+	}
+}
+
 func TestDetailPaneShowsEventsChronologically(t *testing.T) {
 	m := agedTestModel(t, 150, 44, 12)
 	m.describe = &stubDescriber{detail: sampleDetail("")}

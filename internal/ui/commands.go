@@ -28,6 +28,7 @@ const (
 	argZoom
 	argSpeed
 	argRewind
+	argOptional
 )
 
 // command is one entry in the palette.
@@ -100,8 +101,8 @@ var registry = []command{
 		},
 	},
 	{
-		name: "speed", aliases: []string{"rate"}, arg: argSpeed, argHint: "<0x…1x|realtime>",
-		help: "slow, pause, or return the cluster timeline to realtime",
+		name: "speed", aliases: []string{"rate"}, arg: argSpeed, argHint: "<rate|realtime/end>",
+		help: "change timeline rate; archived sessions support up to 16x",
 		run: func(m *Model, arg string) (string, error) {
 			if isRealtime(arg) {
 				m.pendingCmd = m.goRealtime("")
@@ -158,6 +159,30 @@ var registry = []command{
 			}
 			return fmt.Sprintf("rewound %s · %s", moved.Round(time.Millisecond),
 				playbackStatus(m.playback, time.Now())), nil
+		},
+	},
+	{
+		name: "forward", aliases: []string{"ahead"}, arg: argRewind, argHint: "<duration>",
+		help: "seek forward through buffered or archived playback",
+		run: func(m *Model, arg string) (string, error) {
+			amount, err := parseRewindDuration(arg)
+			if err != nil {
+				return "", err
+			}
+			cmd, moved := m.forwardPlayback(amount)
+			m.pendingCmd = cmd
+			if moved == 0 {
+				return "already at the newest recorded state", nil
+			}
+			return fmt.Sprintf("forward %s · %s", moved.Round(time.Millisecond),
+				playbackStatus(m.playback, time.Now())), nil
+		},
+	},
+	{
+		name: "record", aliases: []string{"rec"}, arg: argOptional, argHint: "[path|stop|status]",
+		help: "start or stop session recording; no path uses ~/.config/knv",
+		run: func(m *Model, arg string) (string, error) {
+			return m.runRecording(arg)
 		},
 	},
 	{
@@ -345,7 +370,7 @@ func (m *Model) Run(line string) (string, error) {
 	if cmd.demoOnly && m.demo == nil {
 		return "", fmt.Errorf(":%s only works against a simulated cluster (--demo)", cmd.name)
 	}
-	if cmd.arg != argNone && arg == "" {
+	if cmd.arg != argNone && cmd.arg != argOptional && arg == "" {
 		// An argument-taking command with no argument opens the picker rather
 		// than erroring: ":nodepool<enter>" should show you the nodepools.
 		return "", errNeedsArg
@@ -376,9 +401,17 @@ func (m *Model) candidates(cmd *command) []string {
 	case argZoom:
 		return []string{"in", "out", "fit", "max"}
 	case argSpeed:
+		if m.playback.archive {
+			return []string{"end", "16x", "8x", "4x", "2x", "1x", "0.5x", "0.25x", "0x"}
+		}
 		return []string{"realtime", "1x", "0.75x", "0.5x", "0.25x", "0x"}
 	case argRewind:
 		return []string{"5s", "10s", "20s", "30s"}
+	case argOptional:
+		if m.recordingActive() {
+			return []string{"stop", "status"}
+		}
+		return []string{"start", "status"}
 	default:
 		return nil
 	}
@@ -386,7 +419,7 @@ func (m *Model) candidates(cmd *command) []string {
 
 func isRealtime(s string) bool {
 	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "realtime", "real-time", "live", "rt":
+	case "realtime", "real-time", "live", "rt", "end":
 		return true
 	default:
 		return false
@@ -397,8 +430,8 @@ func parsePlaybackSpeed(s string) (float64, error) {
 	raw := strings.TrimSpace(strings.ToLower(s))
 	raw = strings.TrimSuffix(raw, "x")
 	speed, err := strconv.ParseFloat(raw, 64)
-	if err != nil || speed < 0 || speed > 1 {
-		return 0, fmt.Errorf("expected a speed between 0x and 1x, or realtime")
+	if err != nil || speed < 0 || speed > 16 {
+		return 0, fmt.Errorf("expected a speed between 0x and 16x, or realtime/end")
 	}
 	return speed, nil
 }
