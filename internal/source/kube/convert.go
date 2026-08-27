@@ -27,10 +27,6 @@ const (
 	taintClusterAutoscaler  = "ToBeDeletedByClusterAutoscaler"
 	taintUnschedulable      = "node.kubernetes.io/unschedulable"
 
-	// annotationPrice lets a demo attach a cost to a node or NodeClaim without
-	// this tool having to ship a cloud pricing table.
-	annotationPrice = "node-viewer.oxide.computer/hourly-price"
-
 	// gpuResource is the only accelerator name we count; extend as needed.
 	gpuResource = "nvidia.com/gpu"
 
@@ -41,7 +37,7 @@ const (
 
 // convertNode flattens a corev1.Node into the view model. It never retains a
 // reference into the informer cache object.
-func convertNode(n *corev1.Node) *model.Node {
+func convertNode(n *corev1.Node, priceAnnotation string) *model.Node {
 	out := &model.Node{
 		Name:         n.Name,
 		InstanceType: n.Labels[labelInstanceType],
@@ -50,12 +46,13 @@ func convertNode(n *corev1.Node) *model.Node {
 		Arch:         n.Labels[labelArch],
 		CapacityType: n.Labels[labelCapacityType],
 		NodePool:     n.Labels[labelNodePool],
+		ProviderID:   n.Spec.ProviderID,
 		Schedulable:  !n.Spec.Unschedulable,
 		Created:      n.CreationTimestamp.Time,
 		Allocatable:  resourcesFromList(n.Status.Allocatable),
 		Labels:       copyLabels(n.Labels),
 	}
-	if p, ok := parsePrice(n.Annotations); ok {
+	if p, ok := parsePrice(n.Annotations, priceAnnotation); ok {
 		out.Price, out.HasPrice = p, true
 	}
 
@@ -86,7 +83,7 @@ func readyState(n *corev1.Node) (ready bool, message string) {
 func derivePhase(n *corev1.Node, out *model.Node) model.Phase {
 	if n.DeletionTimestamp != nil {
 		out.Message = "terminating"
-		return model.PhaseDeleting
+		return model.PhaseTerminating
 	}
 	for i := range n.Spec.Taints {
 		t := &n.Spec.Taints[i]
@@ -112,13 +109,10 @@ func derivePhase(n *corev1.Node, out *model.Node) model.Phase {
 	return model.PhaseNotReady
 }
 
-// convertPod flattens a corev1.Pod. Returns nil for pods that will never be
-// drawn (unscheduled, or already finished), which keeps them out of the store
-// entirely rather than being filtered on every frame.
+// convertPod flattens a corev1.Pod. An unassigned pod is converted too — it has
+// no box to live in, but it is the cluster's scheduling backlog, and the store
+// counts it as such.
 func convertPod(p *corev1.Pod) *model.Pod {
-	if p.Spec.NodeName == "" {
-		return nil
-	}
 	out := &model.Pod{
 		Namespace: p.Namespace,
 		Name:      p.Name,
@@ -132,7 +126,25 @@ func convertPod(p *corev1.Pod) *model.Pod {
 	out.DaemonSet = isDaemonSet(p)
 	out.Phase = podPhase(p)
 	out.Ready = podReady(p)
+	out.Unschedulable = podUnschedulable(p)
 	return out
+}
+
+// podUnschedulable reads the scheduler's verdict. Only PodScheduled=False with
+// the Unschedulable reason counts: a pod the scheduler simply has not reached
+// yet has no condition at all, and reporting that as unschedulable would turn
+// every burst of new pods into a false capacity alarm.
+func podUnschedulable(p *corev1.Pod) bool {
+	if p.Spec.NodeName != "" || p.DeletionTimestamp != nil {
+		return false
+	}
+	for i := range p.Status.Conditions {
+		c := &p.Status.Conditions[i]
+		if c.Type == corev1.PodScheduled {
+			return c.Status == corev1.ConditionFalse && c.Reason == corev1.PodReasonUnschedulable
+		}
+	}
+	return false
 }
 
 func podPhase(p *corev1.Pod) model.PodPhase {
@@ -208,8 +220,8 @@ func usageResources(cpu, mem resource.Quantity) model.Resources {
 	return model.Resources{CPUMilli: cpu.MilliValue(), MemBytes: mem.Value()}
 }
 
-func parsePrice(ann map[string]string) (float64, bool) {
-	v, ok := ann[annotationPrice]
+func parsePrice(ann map[string]string, annotation string) (float64, bool) {
+	v, ok := ann[annotation]
 	if !ok {
 		return 0, false
 	}

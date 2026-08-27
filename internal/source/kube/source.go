@@ -42,6 +42,11 @@ import (
 // only a safety net against a missed event; it is deliberately long.
 const Resync = 10 * time.Minute
 
+// DefaultPriceAnnotation is the provider-owned annotation read when the CLI does not select
+// another one. Providers can expose the same numeric value under their own domain and callers can
+// select it through Options without teaching the viewer provider-specific pricing logic.
+const DefaultPriceAnnotation = "karpenter.oxide.computer/hourly-price"
+
 var (
 	nodePoolGVR  = schema.GroupVersionResource{Group: "karpenter.sh", Version: "v1", Resource: "nodepools"}
 	nodeClaimGVR = schema.GroupVersionResource{Group: "karpenter.sh", Version: "v1", Resource: "nodeclaims"}
@@ -49,9 +54,10 @@ var (
 
 // Options configures the cluster connection.
 type Options struct {
-	Kubeconfig  string
-	Context     string
-	MetricsRate time.Duration
+	Kubeconfig      string
+	Context         string
+	MetricsRate     time.Duration
+	PriceAnnotation string
 	// QPS/Burst are raised over client-go's timid defaults because the initial
 	// LIST of pods on a large cluster is otherwise throttled into a slow start.
 	QPS   float32
@@ -83,12 +89,15 @@ func New(opts Options) (*Source, *model.Store, error) {
 	if opts.MetricsRate == 0 {
 		opts.MetricsRate = 5 * time.Second
 	}
+	if opts.PriceAnnotation == "" {
+		opts.PriceAnnotation = DefaultPriceAnnotation
+	}
 	c, err := connect(opts)
 	if err != nil {
 		return nil, nil, err
 	}
 	store := model.NewStore(c.contextName)
-	store.SetCapabilities(c.hasKarpenter, c.hasMetrics)
+	store.SetKarpenter(c.hasKarpenter)
 	return &Source{opts: opts, store: store, clients: c}, store, nil
 }
 
@@ -152,9 +161,6 @@ func hasGroupVersion(disco discovery.DiscoveryInterface, gv string) bool {
 // HasKarpenter reports whether Karpenter CRDs were found.
 func (s *Source) HasKarpenter() bool { return s.clients.hasKarpenter }
 
-// HasMetrics reports whether metrics.k8s.io was found.
-func (s *Source) HasMetrics() bool { return s.clients.hasMetrics }
-
 // ContextName is the kube context in use, for the status bar.
 func (s *Source) ContextName() string { return s.clients.contextName }
 
@@ -188,6 +194,11 @@ func (s *Source) Run(ctx context.Context) error {
 			return err
 		}
 		dynFactory.Start(ctx.Done())
+		// The consolidation verdicts are Karpenter events, so there is nothing to
+		// watch for them without it.
+		if err := s.startConsolidationWatch(ctx); err != nil {
+			return err
+		}
 	}
 
 	// Wait for the initial LIST of every cache before the metrics poller starts,
@@ -212,7 +223,7 @@ func (s *Source) Run(ctx context.Context) error {
 func (s *Source) nodeHandler() cache.ResourceEventHandler {
 	upsert := func(obj interface{}) {
 		if n, ok := obj.(*corev1.Node); ok {
-			s.store.UpsertNode(convertNode(n))
+			s.store.UpsertNode(convertNode(n, s.opts.PriceAnnotation))
 		}
 	}
 	return cache.ResourceEventHandlerFuncs{
@@ -232,11 +243,9 @@ func (s *Source) podHandler() cache.ResourceEventHandler {
 		if !ok {
 			return
 		}
-		if converted := convertPod(p); converted != nil {
-			s.store.UpsertPod(converted)
-		} else {
-			s.store.DeletePod(p.Namespace + "/" + p.Name)
-		}
+		// The store decides what a pod means: placed, backlog, or finished and
+		// therefore nothing at all.
+		s.store.UpsertPod(convertPod(p))
 	}
 	return cache.ResourceEventHandlerFuncs{
 		AddFunc:    upsert,

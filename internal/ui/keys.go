@@ -6,8 +6,6 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
-
-	"github.com/oxidecomputer/k8s-node-viewer/internal/model"
 )
 
 // handleKey routes a keypress. The command bar, when open, swallows everything
@@ -15,6 +13,28 @@ import (
 func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	if m.bar.active {
 		return m.handleBarKey(msg)
+	}
+	// Playback controls are genuinely global: a presenter must be able to pause
+	// or catch up without first closing the detail pane or help overlay.
+	switch msg.String() {
+	case "p":
+		m.togglePause()
+		return nil
+	case "[":
+		cmd, moved := m.rewindPlayback(keyRewindStep)
+		if moved == 0 {
+			m.notify("no rewind history yet", true)
+		} else {
+			m.showSeekOverlay(moved)
+			m.notify(fmt.Sprintf("rewound %s · %s", moved.Round(time.Millisecond),
+				playbackStatus(m.playback, time.Now())), false)
+		}
+		return cmd
+	case "r":
+		return m.goRealtime("")
+	}
+	if m.detail != nil {
+		return m.handleDetailKey(msg)
 	}
 	if m.showHelp {
 		// The scroll keys scroll; any other key closes, which is what everyone
@@ -100,6 +120,7 @@ func (m *Model) handleBarKey(msg tea.KeyMsg) tea.Cmd {
 // that needs an argument turns into a picker instead of an error, which is what
 // makes ":nodepool" followed by Enter feel right.
 func (m *Model) execute(line string) tea.Cmd {
+	m.pendingCmd = nil
 	msg, err := m.Run(line)
 	switch {
 	case errors.Is(err, errNeedsArg):
@@ -119,7 +140,9 @@ func (m *Model) execute(line string) tea.Cmd {
 		m.bar.close()
 	}
 	m.derive()
-	return nil
+	cmd := m.pendingCmd
+	m.pendingCmd = nil
+	return cmd
 }
 
 func trimCommandName(line string) string {
@@ -154,6 +177,11 @@ func (m *Model) handleGlobalKey(msg tea.KeyMsg) tea.Cmd {
 			m.derive()
 		}
 
+	case "enter":
+		// The one drill-down: everything the grid cannot draw about the selected
+		// node, and its events in the order they happened.
+		return m.openDetail()
+
 	case "?":
 		m.showHelp = true
 
@@ -162,14 +190,9 @@ func (m *Model) handleGlobalKey(msg tea.KeyMsg) tea.Cmd {
 		m.notify("filters cleared", false)
 		m.derive()
 
-	case "p":
-		if m.mode == ModePods {
-			m.setMode(ModeNodes)
-			m.notify("pods hidden — utilisation only", false)
-		} else {
-			m.setMode(ModePods)
-			m.notify("pods shown", false)
-		}
+	case "v":
+		m.setMode(Mode((int(m.mode) + 1) % len(modeNames)))
+		m.notify("mode: "+m.mode.String(), false)
 
 	case "d":
 		if m.mode == ModeDense {
@@ -178,17 +201,6 @@ func (m *Model) handleGlobalKey(msg tea.KeyMsg) tea.Cmd {
 			m.setMode(ModeDense)
 		}
 		m.notify("mode: "+m.mode.String(), false)
-
-	case "u":
-		if m.basis == model.BasisUsage {
-			m.basis = model.BasisRequests
-		} else if m.hasMetrics {
-			m.basis = model.BasisUsage
-		} else {
-			m.notify("metrics.k8s.io not available — meters stay on requests", true)
-			return nil
-		}
-		m.notify("meters: "+m.basis.String(), false)
 
 	case "s":
 		m.sortKey = SortKey((int(m.sortKey) + 1) % len(sortNames))
@@ -251,6 +263,11 @@ func (m *Model) handleGlobalKey(msg tea.KeyMsg) tea.Cmd {
 			m.demo.Churn()
 			m.notify("churning pods", false)
 		}
+	case "b":
+		if m.demo != nil {
+			m.demo.Burst(8)
+			m.notify("submitting 8 pods", false)
+		}
 	}
 	return nil
 }
@@ -287,6 +304,20 @@ func (m *Model) handleMouse(msg tea.MouseMsg) tea.Cmd {
 	isWheel := tea.MouseEvent(msg).IsWheel()
 	if debugMouse {
 		defer m.recordMouse(msg)
+	}
+
+	// The detail pane replaces the grid, so the wheel scrolls the text. Zooming a
+	// grid that is not on screen is the one thing it must not do.
+	if m.detail != nil {
+		if isWheel {
+			switch msg.Button {
+			case tea.MouseButtonWheelUp:
+				m.scrollDetail(-detailWheelRows)
+			case tea.MouseButtonWheelDown:
+				m.scrollDetail(detailWheelRows)
+			}
+		}
+		return nil
 	}
 
 	// The help overlay covers the grid, so while it is up the wheel belongs to

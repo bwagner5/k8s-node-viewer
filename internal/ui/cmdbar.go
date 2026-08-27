@@ -173,14 +173,18 @@ func (b *cmdBar) render(w, total int) []string {
 		}
 		fg, bg := t.PanelFg, t.Panel
 		if idx == b.hl && b.hlActive {
-			fg, bg = contrastOn(t.Accent), t.Accent
+			fg, bg = contrastOn(t.Ok), t.Ok
 		} else if idx == b.hl {
 			bg = theme.Mix(t.Panel, t.Accent, 0.22)
 		}
 		c.rect(0, i, w, 1, bg)
 		c.text(2, i, shorten(b.items[idx], w-12), fg, idx == b.hl)
 		if idx == b.hl {
-			c.text(0, i, "▶", t.Accent, true)
+			pointer := t.Accent
+			if b.hlActive {
+				pointer = t.Ok
+			}
+			c.text(0, i, "▶", pointer, true)
 		}
 	}
 	if rest := len(b.items) - (start + rows); rest > 0 && rows > 0 {

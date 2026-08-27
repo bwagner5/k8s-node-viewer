@@ -407,6 +407,7 @@ type stubDemo struct{}
 func (stubDemo) ScaleUp(int) {}
 func (stubDemo) DrainOne()   {}
 func (stubDemo) Churn()      {}
+func (stubDemo) Burst(int)   {}
 
 // The complaint this fixes, in two parts: two-finger scroll zoomed *and* the
 // grid rearranged underneath, so the card you aimed at was not the card you got.

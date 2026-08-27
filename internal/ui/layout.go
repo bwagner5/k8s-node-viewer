@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"math"
 	"strings"
-	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
@@ -344,6 +343,9 @@ func renderDense(vs []visible, w, h int, ctx boxCtx, scroll, cursor int) string 
 	}
 	c.text(cols.xCPU, 0, "CPU", t.Dim, true)
 	c.text(cols.xMem, 0, "MEM", t.Dim, true)
+	if cols.showCons {
+		c.text(cols.xCons, 0, "CONS", t.Dim, true)
+	}
 	c.text(cols.xTail, 0, "PODS  AGE", t.Dim, true)
 	if cols.showState {
 		c.text(cols.xTail+10, 0, "STATE", t.Dim, true)
@@ -354,15 +356,18 @@ func renderDense(vs []visible, w, h int, ctx boxCtx, scroll, cursor int) string 
 		n := v.node
 		y := i + 1
 		track := ctx.reg.Node(n.Name)
-		cpu, mem := n.Util(ctx.basis)
+		cpu, mem := n.Util()
 		track.Target(cpu, mem, false)
-		if n.Phase == model.PhaseGone {
+		if removalReadyToCollapse(n, ctx.now) {
 			track.SetLeaving()
 		}
 
 		phaseCol := t.PhaseColor(int(n.Phase))
 		if n.Phase.Terminal() {
 			phaseCol = theme.Mix(phaseCol, t.Flash, 0.5*ctx.reg.Pulse(track, pulseDraining))
+		}
+		if track.Flash > 0 {
+			phaseCol = theme.Mix(phaseCol, t.Flash, 0.7*track.Flash)
 		}
 		fg := t.Fg
 		if i+scroll == cursor {
@@ -381,28 +386,51 @@ func renderDense(vs []visible, w, h int, ctx boxCtx, scroll, cursor int) string 
 		if cols.showPool {
 			c.text(cols.xPool, y, shorten(n.NodePool, 12), t.Dim, false)
 		}
-		c.hMeter(cols.xCPU, y, cols.meterW, track.CPU, t.Util(track.CPU), t.Empty)
-		c.hMeterTip(cols.xCPU, y, cols.meterW, track.CPU, t.Util(track.CPU), t.Empty)
+		// Rails, not fills: one row per node means every meter has another meter
+		// directly above and below it, and background fills at that density merge
+		// into a single column of colour with no bars in it.
+		c.hMeterRail(cols.xCPU, y, cols.meterW, track.CPU, t.Util(track.CPU), t.Empty)
 		c.text(cols.xCPU+cols.meterW+1, y, fmt.Sprintf("%3.0f%%", track.CPU*100), t.Fg, false)
-		c.hMeter(cols.xMem, y, cols.meterW, track.Mem, t.Util(track.Mem), t.Empty)
-		c.hMeterTip(cols.xMem, y, cols.meterW, track.Mem, t.Util(track.Mem), t.Empty)
+		c.hMeterRail(cols.xMem, y, cols.meterW, track.Mem, t.Util(track.Mem), t.Empty)
 		c.text(cols.xMem+cols.meterW+1, y, fmt.Sprintf("%3.0f%%", track.Mem*100), t.Fg, false)
+		if cols.showCons {
+			// The column is one glyph wide, so it has to carry its meaning in colour
+			// as well: a consolidatable node is one Karpenter may take away.
+			c.text(cols.xCons+1, y, n.Consolidatable.Short(), consolidationColor(n.Consolidatable), true)
+		}
 
-		tail := fmt.Sprintf("%4d %4s", len(v.pods), model.HumanAge(time.Since(n.Created)))
+		tail := fmt.Sprintf("%4d %4s", len(v.pods), model.HumanAge(ctx.now.Sub(n.Created)))
 		if cols.showState {
-			tail += " " + strings.ToLower(n.Phase.String())
+			tail += " " + shorten(densePhaseState(n, ctx.now), denseStateWidth-1)
 		}
 		c.text(cols.xTail, y, tail, phaseCol, false)
 	}
 	return c.String()
 }
 
+// consolidationColor is the CONS column's palette: warn for a node Karpenter is
+// willing to remove (it is about to change under you), quiet for one it will not,
+// dim for a cluster that has not said.
+func consolidationColor(c model.Consolidation) lipgloss.Color {
+	t := theme.Current
+	switch c {
+	case model.ConsolidationYes:
+		return t.Warn
+	case model.ConsolidationNo:
+		return t.Ok
+	default:
+		return t.Dim
+	}
+}
+
 // denseCols is the resolved column geometry for one terminal width.
 type denseCols struct {
-	nameW, meterW                   int
-	xType, xPool, xCPU, xMem, xTail int
-	showType, showPool, showState   bool
+	nameW, meterW                           int
+	xType, xPool, xCPU, xMem, xCons, xTail  int
+	showType, showPool, showState, showCons bool
 }
+
+const denseStateWidth = 20
 
 // denseColumns lays out the dense table by dropping the least useful columns
 // first as width shrinks, rather than letting everything overlap. The node name
@@ -414,10 +442,11 @@ func denseColumns(w int) denseCols {
 		poolW    = 13
 		pctW     = 6
 		podsAgeW = 10
-		stateW   = 13
+		stateW   = denseStateWidth
+		consW    = 5
 	)
-	d := denseCols{showType: true, showPool: true, showState: true}
-	d.meterW = clampInt((w-70)/2, 5, 20)
+	d := denseCols{showType: true, showPool: true, showState: true, showCons: true}
+	d.meterW = clampInt((w-75)/2, 5, 20)
 
 	// Give up columns in increasing order of value until the name fits.
 	for {
@@ -431,6 +460,9 @@ func denseColumns(w int) denseCols {
 		if d.showState {
 			fixed += stateW
 		}
+		if d.showCons {
+			fixed += consW
+		}
 		d.nameW = w - fixed
 		if d.nameW >= minName {
 			break
@@ -440,10 +472,14 @@ func denseColumns(w int) denseCols {
 			d.showPool = false
 		case d.showType:
 			d.showType = false
-		case d.showState:
-			d.showState = false
+		case d.showCons:
+			d.showCons = false
 		case d.meterW > 5:
 			d.meterW--
+		case d.showState:
+			// State is the reason to look at a live demo. It disappears only after
+			// every secondary descriptor and all optional meter width are gone.
+			d.showState = false
 		default:
 			d.nameW = max(4, d.nameW)
 			goto done
@@ -471,6 +507,10 @@ done:
 	x += d.meterW + pctW
 	d.xMem = x
 	x += d.meterW + pctW
+	if d.showCons {
+		d.xCons = x
+		x += consW
+	}
 	d.xTail = x
 	return d
 }

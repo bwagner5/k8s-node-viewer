@@ -32,7 +32,15 @@ type Theme struct {
 	// Title is the node card's header strip.
 	Title lipgloss.Color
 
-	// UtilRamp is sampled by fraction: cool at idle, hot at saturated.
+	// UtilRamp is sampled by fraction, and it runs *toward* green: a packed node
+	// is a node earning its cost, so saturated is the good end and idle is the
+	// unremarkable one. It deliberately does not reach red at the top — red on
+	// this screen means something is wrong (a failing pod, an unschedulable
+	// backlog), and a well-utilised cluster is the opposite of that.
+	//
+	// It stays a continuous ramp rather than discrete buckets so a filling node
+	// reads as motion, and its luminance climbs monotonically so the fill level
+	// is still legible where hue is not.
 	UtilRamp []string
 	// Empty is the unfilled part of a meter.
 	Empty lipgloss.Color
@@ -72,7 +80,8 @@ var Dark = Theme{
 	Well:  "#0e1119",
 	Title: "#222a3a",
 
-	UtilRamp: []string{"#1f6feb", "#2ea043", "#7ee787", "#ffd33d", "#ff9d2e", "#ff5c5c"},
+	// Slate → blue → cyan → green → mint: idle is quiet, full is bright green.
+	UtilRamp: []string{"#4a5468", "#1f6feb", "#22b8cf", "#22c55e", "#4ade80"},
 	Empty:    "#20242e",
 
 	// Phase colours are saturated: they only ever appear as thin borders, where
@@ -83,7 +92,7 @@ var Dark = Theme{
 		"#2ea043", // Ready
 		"#58a6ff", // Cordoned
 		"#ffd33d", // Draining
-		"#ff5c5c", // Deleting
+		"#ff5c5c", // Terminating
 		"#6e7681", // Gone
 	},
 
@@ -115,7 +124,10 @@ var Light = Theme{
 	Well:  "#e4e8ef",
 	Title: "#dde3ec",
 
-	UtilRamp: []string{"#0969da", "#1a7f37", "#3fb950", "#d4a72c", "#e16f24", "#cf222e"},
+	// The same walk, inverted in luminance: on white it is the *dark* end that
+	// carries, so the ramp starts as a pale grey and deepens into green. A full
+	// meter has to be the most prominent thing on the card either way.
+	UtilRamp: []string{"#c2cad4", "#79b0e8", "#2f9bb8", "#1f8a4d", "#136c36"},
 	Empty:    "#dfe3e9",
 
 	Phase: []lipgloss.Color{

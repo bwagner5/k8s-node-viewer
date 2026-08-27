@@ -23,12 +23,12 @@ const (
 	glyphFailed      = '╳'
 )
 
-// Pulse periods. Deleting is deliberately faster than draining: urgency should
+// Pulse periods. Terminating is deliberately faster than draining: urgency should
 // be legible without reading the label.
 const (
 	pulseProvisioning = 1400 * time.Millisecond
 	pulseDraining     = 1100 * time.Millisecond
-	pulseDeleting     = 550 * time.Millisecond
+	pulseTerminating  = 550 * time.Millisecond
 )
 
 // borderSet is the six glyphs of a box border.
@@ -46,11 +46,9 @@ var (
 // struct keeps the signature stable as the UI grows options.
 type boxCtx struct {
 	reg      *anim.Registry
-	basis    model.Basis
 	mode     Mode
+	now      time.Time
 	selected bool
-	// dimPods greys pods that do not match the pod-level filter.
-	dimPods bool
 }
 
 // renderNodeBox draws one node into exactly h lines of width w.
@@ -63,10 +61,10 @@ func renderNodeBox(v visible, w, h int, ctx boxCtx) []string {
 	n := v.node
 	track := ctx.reg.Node(n.Name)
 
-	cpuFrac, memFrac := n.Util(ctx.basis)
+	cpuFrac, memFrac := n.Util()
 	track.Target(cpuFrac, memFrac, false)
 
-	if n.Phase == model.PhaseGone {
+	if removalReadyToCollapse(n, ctx.now) {
 		track.SetLeaving()
 	}
 
@@ -109,6 +107,9 @@ func renderNodeBox(v visible, w, h int, ctx boxCtx) []string {
 	}
 
 	drawBorder(c, w, drawH, border, borderColor, cardBg)
+	if ctx.selected {
+		drawSelectionCorners(c, w, drawH)
+	}
 
 	// A title strip gives the card a head, which is what makes one node
 	// visually separable from the next. Short cards fall back to the name in
@@ -166,11 +167,14 @@ func borderStyle(n *model.Node, track *anim.Track, ctx boxCtx) (borderSet, lipgl
 	case model.PhaseDraining:
 		set = borderHeavy
 		base = theme.Mix(base, t.Flash, 0.55*ctx.reg.Pulse(track, pulseDraining))
-	case model.PhaseDeleting:
+	case model.PhaseTerminating:
 		set = borderHeavy
-		base = theme.Mix(base, t.Flash, 0.7*ctx.reg.Pulse(track, pulseDeleting))
+		base = theme.Mix(base, t.Flash, 0.7*ctx.reg.Pulse(track, pulseTerminating))
 	case model.PhaseNotReady:
 		set = borderHeavy
+	}
+	if track.Flash > 0 {
+		base = theme.Mix(base, t.Flash, 0.7*track.Flash)
 	}
 
 	// A brand-new box flashes white as it grows, which is what draws the eye to
@@ -178,11 +182,17 @@ func borderStyle(n *model.Node, track *anim.Track, ctx boxCtx) (borderSet, lipgl
 	if track.Enter < 1 {
 		base = theme.Mix(t.Flash, base, track.EnterEase())
 	}
-	if ctx.selected {
-		set = borderHeavy
-		base = theme.Mix(base, t.Selected, 0.5)
-	}
 	return set, base
+}
+
+// drawSelectionCorners gives selection its own visual channel. In particular it
+// does not wash the phase border toward white, which made the selected node's
+// lifecycle colour the hardest one on screen to identify.
+func drawSelectionCorners(c *canvas, w, h int) {
+	t := theme.Current
+	for _, pt := range [][2]int{{0, 0}, {w - 1, 0}, {0, h - 1}, {w - 1, h - 1}} {
+		c.fillRect(pt[0], pt[1], 1, 1, '◆', t.Selected, t.Card)
+	}
 }
 
 // phaseEdge is the border colour for a phase.
@@ -232,16 +242,17 @@ func drawTitleBar(c *canvas, w, y int, v visible, col lipgloss.Color, ctx boxCtx
 	c.rect(1, y, w-2, 1, bg)
 
 	fg := contrastOn(bg)
-	badge := phaseBadge(n)
-	avail := w - 4
-	if badge != "" && avail > runewidth.StringWidth(badge)+8 {
-		avail -= runewidth.StringWidth(badge) + 2
-	} else {
-		badge = ""
+	badge := phaseBadgeForWidth(n.Phase, max(1, w-9))
+	chipW := runewidth.StringWidth(badge) + 2
+	badgeX := w - 1 - chipW
+	avail := max(1, badgeX-3)
+	if badge == "" {
+		avail = w - 4
 	}
 	c.text(2, y, shorten(n.Name, avail), fg, true)
 	if badge != "" {
-		c.textRight(0, y, w-2, badge+" ", theme.Mix(fg, col, 0.45), true)
+		c.rect(badgeX, y, chipW, 1, col)
+		c.text(badgeX, y, " "+badge+" ", contrastOn(col), true)
 	}
 }
 
@@ -249,12 +260,12 @@ func drawTitleBar(c *canvas, w, y int, v visible, col lipgloss.Color, ctx boxCtx
 func drawTitleInBorder(c *canvas, w int, v visible, col lipgloss.Color, ctx boxCtx, fade float64) {
 	t := theme.Current
 	n := v.node
-	badge := phaseBadge(n)
-	avail := w - 4
-	if badge != "" && avail > runewidth.StringWidth(badge)+6 {
-		avail -= runewidth.StringWidth(badge) + 1
-	} else {
-		badge = ""
+	badge := phaseBadgeForWidth(n.Phase, max(1, w-9))
+	chipW := runewidth.StringWidth(badge) + 2
+	badgeX := w - 1 - chipW
+	avail := max(1, badgeX-3)
+	if badge == "" {
+		avail = w - 4
 	}
 
 	nameColor := t.Fg
@@ -266,29 +277,8 @@ func drawTitleInBorder(c *canvas, w int, v visible, col lipgloss.Color, ctx boxC
 	}
 	c.text(1, 0, " "+shorten(n.Name, avail)+" ", nameColor, true)
 	if badge != "" {
-		c.textRight(0, 0, w-2, " "+badge+" ", col, true)
-	}
-}
-
-func phaseBadge(n *model.Node) string {
-	switch n.Phase {
-	case model.PhaseProvisioning:
-		return "◇ new"
-	case model.PhaseDraining:
-		return "▼ drain"
-	case model.PhaseDeleting:
-		return "✕ term"
-	case model.PhaseCordoned:
-		return "⏸ cord"
-	case model.PhaseNotReady:
-		return "! down"
-	case model.PhaseGone:
-		return "✕"
-	default:
-		if n.CapacityType == "spot" {
-			return "spot"
-		}
-		return ""
+		c.rect(badgeX, 0, chipW, 1, col)
+		c.text(badgeX, 0, " "+badge+" ", contrastOn(col), true)
 	}
 }
 
@@ -302,11 +292,8 @@ func drawFooter(c *canvas, w, h int, v visible, col lipgloss.Color, ctx boxCtx, 
 	}
 
 	right := fmt.Sprintf("%dp", len(v.pods))
-	if ctx.dimPods && v.matchCount != len(v.pods) {
-		right = fmt.Sprintf("%d/%dp", v.matchCount, len(v.pods))
-	}
 	if !n.Created.IsZero() && w >= 24 {
-		right += " " + model.HumanAge(time.Since(n.Created))
+		right += " " + model.HumanAge(ctx.now.Sub(n.Created))
 	}
 	c.textRight(0, h-1, w-2, " "+right+" ", dim, false)
 
@@ -317,11 +304,20 @@ func drawFooter(c *canvas, w, h int, v visible, col lipgloss.Color, ctx boxCtx, 
 	// the bottom border and touching reads as corruption.
 	avail := w - 8 - runewidth.StringWidth(right)
 	left := n.InstanceType
-	if n.NodePool != "" && avail >= runewidth.StringWidth(left)+len(n.NodePool)+3 {
+	leftCol := dim
+	leftBold := false
+	if trail := recentPhaseTrail(n, ctx.now, w < 34); trail != "" {
+		left = trail
+		if w >= 34 {
+			left = "recent: " + left
+		}
+		leftCol = col
+		leftBold = true
+	} else if n.NodePool != "" && avail >= runewidth.StringWidth(left)+len(n.NodePool)+3 {
 		left = n.NodePool + " · " + left
 	}
 	if left != "" && avail > 2 {
-		c.text(2, h-1, " "+shorten(left, avail)+" ", dim, false)
+		c.text(2, h-1, " "+shorten(left, avail)+" ", leftCol, leftBold)
 	}
 }
 
@@ -345,7 +341,7 @@ func drawPodsInterior(c *canvas, v visible, track *anim.Track, ctx boxCtx, accen
 		}
 		c.rect(0, 0, c.w, podRows, well)
 		drawPodCells(c, 0, 0, c.w, podRows, v, ctx, well)
-		if v.node.Phase == model.PhaseDraining || v.node.Phase == model.PhaseDeleting {
+		if v.node.Phase == model.PhaseDraining || v.node.Phase == model.PhaseTerminating {
 			// Hatch only the free capacity, and only in the pod area: the stripes
 			// read as "this space is being given up" while leaving the pods that
 			// are still running crisp, and leaving the meters untouched.
@@ -441,7 +437,7 @@ func drawPodCells(c *canvas, x, y, w, h int, v visible, ctx boxCtx, bg lipgloss.
 		if size == 0 {
 			break // ran out of room; the footer count still reports the truth
 		}
-		col := podColor(p, v.matched[i], ctx)
+		col := podColor(p, ctx)
 		glyph := podGlyph(p)
 		for k := 0; k < size && pos < total; k++ {
 			cx, cy := x+pos%w, y+pos/w
@@ -481,21 +477,18 @@ func podCellSizes(v visible, total int) ([]int, bool) {
 // podColor maps a pod to its cell colour. Pods are coloured by state and only
 // by state: a colour with a fixed, stated meaning beats a hash of a workload
 // name that nobody can decode, and it keeps the legend to a single row.
-func podColor(p *model.Pod, matched bool, ctx boxCtx) lipgloss.Color {
+func podColor(p *model.Pod, ctx boxCtx) lipgloss.Color {
 	t := theme.Current
-	if ctx.dimPods && !matched {
-		return t.PodDim
-	}
 	switch p.Phase {
 	case model.PodFailed:
 		return t.PodFailed
 	case model.PodPending:
 		return t.PodPending
 	case model.PodTerminating:
-		// Pulse toward the deleting red so an eviction is visible even in a box
+		// Pulse toward the terminating red so an eviction is visible even in a box
 		// you are not looking directly at.
-		return theme.Mix(t.PodTerminating, t.PhaseColor(int(model.PhaseDeleting)),
-			0.35*ctx.reg.Pulse(ctx.reg.Pod(p.Key()), pulseDeleting))
+		return theme.Mix(t.PodTerminating, t.PhaseColor(int(model.PhaseTerminating)),
+			0.35*ctx.reg.Pulse(ctx.reg.Pod(p.Key()), pulseTerminating))
 	}
 	// New pods flash bright and settle into the running colour.
 	if track := ctx.reg.Pod(p.Key()); track.Enter < 1 {

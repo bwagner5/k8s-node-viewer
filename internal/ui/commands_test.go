@@ -4,6 +4,9 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/oxidecomputer/k8s-node-viewer/internal/model"
 )
@@ -30,33 +33,8 @@ func TestRegistryIsWellFormed(t *testing.T) {
 	}
 }
 
-func TestPhaseCommandNamesMatchModel(t *testing.T) {
-	// These two lists are index-aligned by hand; drift would silently make
-	// ":phase draining" filter for the wrong state.
-	for i, name := range phaseCommandNames {
-		if got := strings.ToLower(model.Phase(i).String()); got != name {
-			t.Fatalf("phase %d: command name %q, model name %q", i, name, got)
-		}
-	}
-	if len(phaseCommandNames) != len(phaseNamesForTest()) {
-		t.Fatal("phase list lengths differ")
-	}
-}
-
-func phaseNamesForTest() []string {
-	var out []string
-	for p := model.PhaseProvisioning; ; p++ {
-		s := p.String()
-		if s == "Unknown" {
-			return out
-		}
-		out = append(out, s)
-	}
-}
-
 func TestCommandsAffectViewState(t *testing.T) {
 	m := newTestModel(t, 160, 44, 6)
-	m.hasMetrics = true
 
 	for _, tc := range []struct {
 		line  string
@@ -64,17 +42,9 @@ func TestCommandsAffectViewState(t *testing.T) {
 	}{
 		{":nodepool general", func() bool { return m.filter.NodePool == "general" }},
 		{":nodepool all", func() bool { return m.filter.NodePool == "" }},
-		{":ns ml", func() bool { return m.filter.Namespace == "ml" }},
 		{":mode nodes", func() bool { return m.mode == ModeNodes }},
-		{":pods on", func() bool { return m.mode == ModePods }},
-		{":pods off", func() bool { return m.mode == ModeNodes }},
 		{":sort cpu", func() bool { return m.sortKey == SortCPU }},
-		{":util usage", func() bool { return m.basis == model.BasisUsage }},
-		{":ds off", func() bool { return m.filter.HideDaemonSets }},
-		{":only on", func() bool { return m.filter.Only }},
 		{":node ip-10", func() bool { return m.filter.NodeQuery == "ip-10" }},
-		{":phase draining", func() bool { return m.filter.Phases[model.PhaseDraining] }},
-		{":phase draining", func() bool { return m.filter.Phases == nil }}, // toggles back off
 		{":clear", func() bool { return !m.filter.Active() }},
 	} {
 		if _, err := m.Run(tc.line); err != nil {
@@ -108,9 +78,129 @@ func TestCommandErrors(t *testing.T) {
 		t.Fatal(":drain should be refused when not in demo mode")
 	}
 
-	m.hasMetrics = false
-	if _, err := m.Run(":util usage"); err == nil {
-		t.Fatal(":util usage should be refused without metrics-server")
+}
+
+func TestPlaybackCommandsDistinguishOneSpeedFromRealtime(t *testing.T) {
+	m := newTestModel(t, 160, 44, 3)
+	now := time.Now()
+	m.playback.latest = &model.Snapshot{Generation: 99, Taken: now.Add(10 * time.Second)}
+
+	if _, err := m.Run(":speed 0.5x"); err != nil {
+		t.Fatal(err)
+	}
+	m.playback.queue = append(m.playback.queue, m.playback.latest)
+	if _, err := m.Run(":speed 1"); err != nil {
+		t.Fatal(err)
+	}
+	if m.playback.live || m.playback.speed != 1 || len(m.playback.queue) != 1 {
+		t.Fatalf("1x should preserve delayed playback: live=%v speed=%v queue=%d",
+			m.playback.live, m.playback.speed, len(m.playback.queue))
+	}
+
+	if _, err := m.Run(":speed realtime"); err != nil {
+		t.Fatal(err)
+	}
+	if !m.playback.live || len(m.playback.queue) != 0 || m.snap.Generation != 99 {
+		t.Fatalf("realtime did not flush to latest: live=%v queue=%d generation=%d",
+			m.playback.live, len(m.playback.queue), m.snap.Generation)
+	}
+}
+
+func TestPlaybackRewindCommandUsesRollingLiveHistory(t *testing.T) {
+	m := newTestModel(t, 160, 44, 3)
+	now := time.Now()
+	old := &model.Snapshot{Generation: 1, Taken: now.Add(-10 * time.Second)}
+	current := &model.Snapshot{Generation: 2, Taken: now}
+	for _, item := range []struct {
+		snap *model.Snapshot
+		at   time.Time
+	}{{old, old.Taken}, {current, current.Taken}} {
+		m.playback.Ingest(item.snap, item.at)
+		m.applySnapshot(item.snap)
+	}
+
+	msg, err := m.Run(":rewind 5s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(msg, "rewound") || m.playback.live || m.snap.Generation != 1 || len(m.playback.queue) != 1 {
+		t.Fatalf("rewind command: msg=%q live=%v generation=%d queue=%d",
+			msg, m.playback.live, m.snap.Generation, len(m.playback.queue))
+	}
+	if _, err := m.Run(":rewind 0s"); err == nil {
+		t.Fatal("zero-duration rewind succeeded")
+	}
+}
+
+func TestFrameDelayDoesNotDistortPlaybackSpeed(t *testing.T) {
+	m := newTestModel(t, 120, 40, 1)
+	start := time.Date(2026, 8, 23, 12, 0, 0, 0, time.Local)
+	m.last = start
+	m.playback.live = false
+	m.playback.speed = .5
+	m.playback.now = start
+
+	m.Update(frameMsg(start.Add(2 * time.Second)))
+	if want := start.Add(time.Second); m.playback.now != want {
+		t.Fatalf("2s frame delay at 0.5x advanced to %s, want %s", m.playback.now, want)
+	}
+}
+
+func TestRewindSnapsMetersToTheSoughtSnapshot(t *testing.T) {
+	m := New(Config{FPS: 20, Legend: true})
+	m.w, m.h = 160, 44
+	now := time.Now()
+	old := testSnapshot(1)
+	old.Generation, old.Taken = 1, now.Add(-10*time.Second)
+	old.Nodes[0].Requests = model.Resources{CPUMilli: 1000, MemBytes: 4 << 30, Pods: 1}
+	old.Totals.Requests = old.Nodes[0].Requests
+	current := testSnapshot(1)
+	current.Generation, current.Taken = 2, now
+	current.Nodes[0].Requests = model.Resources{CPUMilli: 12000, MemBytes: 48 << 30, Pods: 1}
+	current.Totals.Requests = current.Nodes[0].Requests
+
+	for _, item := range []struct {
+		snap *model.Snapshot
+		at   time.Time
+	}{{old, old.Taken}, {current, current.Taken}} {
+		m.playback.Ingest(item.snap, item.at)
+		m.applySnapshot(item.snap)
+		m.View()
+		m.reg.Advance(time.Second)
+		m.fleet.Step(time.Second)
+	}
+	if m.reg.Node(current.Nodes[0].Name).CPU < .7 {
+		t.Fatal("test did not settle on the newer high-utilisation meter")
+	}
+
+	if _, moved := m.rewindPlayback(5 * time.Second); moved == 0 {
+		t.Fatal("rewind found no history")
+	}
+	m.View() // establishes meter targets from the sought snapshot
+	nodeCPU, _ := old.Nodes[0].Util()
+	fleetCPU, _ := old.Totals.Requests.Frac(old.Totals.Allocatable)
+	if got := m.reg.Node(old.Nodes[0].Name).CPU; got != nodeCPU {
+		t.Fatalf("node meter after rewind = %v, want %v", got, nodeCPU)
+	}
+	if got := m.fleet.CPU; got != fleetCPU {
+		t.Fatalf("fleet meter after rewind = %v, want %v", got, fleetCPU)
+	}
+}
+
+func TestPlaybackKeysAreGlobal(t *testing.T) {
+	m := newTestModel(t, 120, 40, 3)
+	m.detail = &detailView{}
+	m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	if m.playback.live || m.playback.speed != 0 {
+		t.Fatalf("p did not pause from detail pane: live=%v speed=%v", m.playback.live, m.playback.speed)
+	}
+	m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	if m.playback.live || m.playback.speed != 1 {
+		t.Fatalf("p did not resume delayed 1x: live=%v speed=%v", m.playback.live, m.playback.speed)
+	}
+	m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	if !m.playback.live {
+		t.Fatal("r did not return to realtime from detail pane")
 	}
 }
 
@@ -147,43 +237,68 @@ func TestCommandBarCompletion(t *testing.T) {
 	}
 }
 
+func TestRemovedCommandsAreUnavailable(t *testing.T) {
+	removed := []string{
+		"capacity", "cap", "namespace", "ns", "only", "owner", "app", "workload",
+		"phase", "state", "pods", "type", "instance", "util", "basis", "daemonsets", "ds",
+	}
+	names := commandNames(false)
+	m := newTestModel(t, 160, 44, 6)
+	for _, removedName := range removed {
+		if _, err := m.Run(":" + removedName); err == nil {
+			t.Errorf("removed command %q is still callable", removedName)
+		}
+	}
+	for _, name := range names {
+		for _, removedName := range removed {
+			if name == removedName {
+				t.Errorf("removed command %q appears in completion menu", name)
+			}
+		}
+	}
+	for _, line := range helpLines(false) {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		for _, removedName := range removed {
+			if fields[0] == ":"+removedName {
+				t.Errorf("removed command %q appears in help", removedName)
+			}
+		}
+	}
+}
+
+func TestCommandListEndsWithClearThenHelp(t *testing.T) {
+	for _, includeDemo := range []bool{false, true} {
+		names := commandNames(includeDemo)
+		if len(names) < 2 || names[len(names)-2] != "clear" || names[len(names)-1] != "help" {
+			t.Fatalf("includeDemo=%v: command list ends with %v, want [clear help]", includeDemo, names)
+		}
+
+		lines := helpLines(includeDemo)
+		if len(lines) < 2 || !strings.HasPrefix(strings.TrimSpace(lines[len(lines)-2]), ":clear ") ||
+			!strings.HasPrefix(strings.TrimSpace(lines[len(lines)-1]), ":help ") {
+			t.Fatalf("includeDemo=%v: help command list does not end with clear then help: %v",
+				includeDemo, lines[max(0, len(lines)-2):])
+		}
+	}
+}
+
+func TestVKeyCyclesAllViewModes(t *testing.T) {
+	m := newTestModel(t, 160, 44, 6)
+	for _, want := range []Mode{ModeNodes, ModeDense, ModePods} {
+		m.handleGlobalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'v'}})
+		if m.mode != want {
+			t.Fatalf("v selected %s, want %s", m.mode, want)
+		}
+	}
+}
+
 func TestFuzzyRanking(t *testing.T) {
 	got := rank([]string{"general", "spot-batch", "gpu"}, "spt")
 	if len(got) == 0 || got[0] != "spot-batch" {
 		t.Fatalf("fuzzy match failed: %v", got)
-	}
-}
-
-func TestNamespaceFilterHighlightsRatherThanHides(t *testing.T) {
-	snap := testSnapshot(6)
-	f := Filter{Namespace: "ml"}
-
-	vs := f.Apply(snap, SortName, false)
-	if len(vs) != len(snap.Nodes) {
-		t.Fatal("a namespace filter must not remove nodes by default")
-	}
-	sawUnmatched := false
-	for _, v := range vs {
-		for i, p := range v.pods {
-			if v.matched[i] != (p.Namespace == "ml") {
-				t.Fatalf("pod %s match flag is wrong", p.Name)
-			}
-			if !v.matched[i] {
-				sawUnmatched = true
-			}
-		}
-	}
-	if !sawUnmatched {
-		t.Fatal("test data has no pods outside the filtered namespace")
-	}
-
-	// With :only on, nodes with nothing matching drop out.
-	f.Only = true
-	only := f.Apply(snap, SortName, false)
-	for _, v := range only {
-		if v.matchCount == 0 && v.node.Phase != model.PhaseGone {
-			t.Fatalf("node %s survived :only with no matching pods", v.node.Name)
-		}
 	}
 }
 

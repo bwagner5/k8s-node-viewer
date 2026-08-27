@@ -30,6 +30,7 @@ type Controller interface {
 	ScaleUp(n int)
 	DrainOne()
 	Churn()
+	Burst(n int)
 }
 
 // Options configures the simulation.
@@ -93,12 +94,22 @@ type Cluster struct {
 	opts  Options
 	store *model.Store
 
-	mu      sync.Mutex
-	rng     *rand.Rand
-	nodes   map[string]*simNode
-	seq     int
+	mu    sync.Mutex
+	rng   *rand.Rand
+	nodes map[string]*simNode
+	seq   int
+	// backlog is the unassigned pods, keyed as the store keys them. They belong
+	// to no node by definition, which is why they are held here rather than on a
+	// simNode.
+	backlog map[string]*model.Pod
 	pending []func() // actions queued to fire on a later tick
 }
+
+// unschedulableAfter is how long an unplaceable pod waits before the simulated
+// scheduler admits defeat. Real clusters take a scheduling cycle or two; this is
+// long enough that a burst reads as "waiting" first and "refused" second, which
+// is the sequence worth narrating.
+const unschedulableAfter = 2 * time.Second
 
 type simNode struct {
 	node     *model.Node
@@ -110,6 +121,11 @@ type simNode struct {
 	// readyAt models the gap between "instance launched" and "kubelet
 	// registered", which is the part of a scale-up worth watching.
 	readyAt time.Time
+	// events is the node's history, as the describe pane shows it. The
+	// simulation records its own events rather than deriving them on demand,
+	// because the interesting thing about an event stream is its order — and
+	// order is only knowable as it happens.
+	events []model.Event
 }
 
 // New builds a simulation and its store.
@@ -130,12 +146,13 @@ func New(opts Options) (*Cluster, *model.Store) {
 		opts.DrainFor = 4 * time.Second
 	}
 	store := model.NewStore("demo (simulated)")
-	store.SetCapabilities(true, true)
+	store.SetKarpenter(true)
 	c := &Cluster{
-		opts:  opts,
-		store: store,
-		rng:   rand.New(rand.NewSource(opts.Seed)),
-		nodes: map[string]*simNode{},
+		opts:    opts,
+		store:   store,
+		rng:     rand.New(rand.NewSource(opts.Seed)),
+		nodes:   map[string]*simNode{},
+		backlog: map[string]*model.Pod{},
 	}
 	return c, store
 }
@@ -174,9 +191,15 @@ func (c *Cluster) seed() {
 		n.born = time.Now().Add(-time.Duration(1+c.rng.Intn(600)) * time.Minute)
 		n.node.Created = n.born
 		c.promoteLocked(n)
+		// Replace the live-stamped launch events with a backdated sequence: this
+		// node is being presented as hours old.
+		c.launchHistoryLocked(n)
 		for j := 0; j < 3+c.rng.Intn(8); j++ {
 			c.schedulePodLocked(n)
 		}
+		// A verdict from the start, so the table's column is populated on the first
+		// frame rather than filling in over the first minute.
+		c.consolidationVerdictLocked(n)
 		c.publishLocked(n)
 	}
 }
@@ -197,18 +220,38 @@ func (c *Cluster) step() {
 			for j := 0; j < 2+c.rng.Intn(4); j++ {
 				c.schedulePodLocked(n)
 			}
+			c.consolidationVerdictLocked(n)
 			c.publishLocked(n)
 		case n.draining:
 			c.stepDrainLocked(n, now)
 		}
 	}
 
+	c.stepBacklogLocked(now)
+
 	if !c.opts.Autopilot {
 		c.runPendingLocked()
 		return
 	}
+	// The interesting loop: a burst arrives, the schedulable capacity absorbs
+	// what it can, the rest goes red, and a provisioner answers it. Reacting to
+	// unschedulable pods rather than to a timer is what makes the scale-up look
+	// caused rather than coincidental.
+	if c.unschedulableCountLocked() > 0 && c.chance(0.30) {
+		c.scaleUpLocked(1 + c.rng.Intn(2))
+	}
+	if c.chance(0.04) {
+		c.burstLocked(4 + c.rng.Intn(6))
+	}
 	if c.chance(0.10) {
 		c.churnLocked()
+	}
+	// Karpenter re-evaluates continuously, so a verdict is never far from fresh —
+	// which is what keeps the column from expiring mid-demo.
+	if c.chance(0.25) {
+		if n := c.pickLocked(func(s *simNode) bool { return !s.draining && s.node.Phase == model.PhaseReady }); n != nil {
+			c.consolidationVerdictLocked(n)
+		}
 	}
 	if c.chance(0.035) {
 		c.scaleUpLocked(1 + c.rng.Intn(3))
@@ -256,6 +299,15 @@ func (c *Cluster) Churn() {
 	}
 }
 
+// Burst submits n unassigned pods, as a job queue or a deployment scale-out
+// does. Whatever does not fit the current fleet becomes unschedulable, which is
+// the cue for a scale-up.
+func (c *Cluster) Burst(n int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.burstLocked(n)
+}
+
 // --- simulation internals ---
 
 func (c *Cluster) scaleUpLocked(count int) {
@@ -281,15 +333,17 @@ func (c *Cluster) launchLocked(pool string) *simNode {
 	if pool == "spot-batch" {
 		capacity = "spot"
 	}
+	zone := fmt.Sprintf("us-west-2%c", 'a'+rune(c.rng.Intn(3)))
 	node := &model.Node{
 		Name:         name,
 		NodeClaim:    fmt.Sprintf("%s-%s", pool, randSuffix(c.rng)),
 		NodePool:     pool,
 		InstanceType: it.name,
-		Zone:         fmt.Sprintf("us-west-2%c", 'a'+rune(c.rng.Intn(3))),
+		Zone:         zone,
 		Region:       "us-west-2",
 		Arch:         "amd64",
 		CapacityType: capacity,
+		ProviderID:   fmt.Sprintf("aws:///%s/i-0%s", zone, randSuffix(c.rng)),
 		Created:      now,
 		Phase:        model.PhaseProvisioning,
 		Message:      "Launched",
@@ -310,8 +364,15 @@ func (c *Cluster) launchLocked(pool string) *simNode {
 		readyAt: now.Add(time.Duration(2500+c.rng.Intn(4000)) * time.Millisecond),
 	}
 	c.nodes[name] = sn
+	c.recordLocked(sn, "NodeClaim", "Normal", "Launched", "karpenter",
+		fmt.Sprintf("Launched instance: %s, %s, %s", it.name, capacity, node.Zone))
 	// Register the claim first, with no Node: this is the provisioning box.
-	c.store.UpsertClaim(sn.claim, cloneNode(node))
+	// status.nodeName is empty this early, so the placeholder is named after the
+	// claim — exactly as the Karpenter informer builds it, and the reason the
+	// providerID join has to carry the handover.
+	claim := cloneNode(node)
+	claim.Name = node.NodeClaim
+	c.store.UpsertClaim(sn.claim, claim)
 	return sn
 }
 
@@ -320,6 +381,21 @@ func (c *Cluster) promoteLocked(n *simNode) {
 	n.node.Ready = true
 	n.node.Schedulable = true
 	n.node.Message = ""
+	c.recordLocked(n, "NodeClaim", "Normal", "Registered", "karpenter",
+		fmt.Sprintf("Status condition transitioned, Type: Registered, Status: Unknown -> True, Reason: Registered, Node: %s", n.node.Name))
+	c.recordLocked(n, "Node", "Normal", "Starting", "kubelet", "Starting kubelet.")
+	c.recordLocked(n, "Node", "Normal", "NodeReady", "kubelet",
+		fmt.Sprintf("Node %s status is now: NodeReady", n.node.Name))
+	c.recordLocked(n, "Node", "Normal", "RegisteredNode", "node-controller",
+		fmt.Sprintf("Node %s event: Registered Node %s in Controller", n.node.Name, n.node.Name))
+	// Karpenter writes status.nodeName on its own reconcile, a beat after kubelet
+	// registers. Replaying that update late rather than at promotion time is what
+	// keeps the simulation honest about the window the store has to close.
+	c.after(func() {
+		resolved := cloneNode(n.node)
+		resolved.Phase = model.PhaseProvisioning
+		c.store.UpsertClaim(n.claim, resolved)
+	})
 	for _, ds := range daemonSets {
 		p := &model.Pod{
 			Namespace: ds.namespace,
@@ -376,6 +452,87 @@ func (c *Cluster) schedulePodLocked(n *simNode) {
 	})
 }
 
+// burstLocked submits n pods with no node. They are pushed to the store
+// immediately: an unassigned pod is real the moment it is created, and the
+// backlog meter is the only thing that can show it.
+func (c *Cluster) burstLocked(n int) {
+	for i := 0; i < n; i++ {
+		w := workloads[c.rng.Intn(len(workloads))]
+		p := &model.Pod{
+			Namespace: w.namespace,
+			Name:      fmt.Sprintf("%s-%s-%s", w.name, randSuffix(c.rng), randSuffix(c.rng)[:4]),
+			Phase:     model.PodPending,
+			Owner:     w.name,
+			Requests:  model.Resources{CPUMilli: w.cpu, MemBytes: w.mem, Pods: 1},
+			Created:   time.Now(),
+		}
+		c.backlog[p.Key()] = p
+		c.store.UpsertPod(p)
+	}
+}
+
+// stepBacklogLocked runs one scheduling cycle: place what fits, and mark what
+// does not — once it has waited long enough — unschedulable.
+func (c *Cluster) stepBacklogLocked(now time.Time) {
+	// A couple of placements per tick, so a burst drains visibly instead of
+	// snapping onto the fleet between two frames.
+	const placementsPerTick = 2
+	placed := 0
+	for key, p := range c.backlog {
+		if n := c.fitLocked(p.Requests); n != nil {
+			delete(c.backlog, key)
+			p.NodeName = n.node.Name
+			p.Unschedulable = false
+			n.pods[key] = p
+			c.store.UpsertPod(p)
+			// Pending -> Running a beat later, exactly as a directly scheduled pod
+			// does, so a placed cell settles in rather than appearing full-grown.
+			c.after(func() {
+				if live, ok := n.pods[key]; ok {
+					live.Phase, live.Ready = model.PodRunning, true
+					c.store.UpsertPod(live)
+					c.publishLocked(n)
+				}
+			})
+			c.publishLocked(n)
+			if placed++; placed >= placementsPerTick {
+				return
+			}
+			continue
+		}
+		if !p.Unschedulable && now.Sub(p.Created) > unschedulableAfter {
+			p.Unschedulable = true
+			c.store.UpsertPod(p)
+		}
+	}
+}
+
+// fitLocked finds a node the pod would actually fit on, using the same
+// no-overcommit rule as direct scheduling.
+func (c *Cluster) fitLocked(req model.Resources) *simNode {
+	return c.pickLocked(func(s *simNode) bool {
+		if s.draining || s.node.Phase != model.PhaseReady {
+			return false
+		}
+		var used model.Resources
+		for _, p := range s.pods {
+			used = used.Add(p.Requests)
+		}
+		return used.CPUMilli+req.CPUMilli <= s.node.Allocatable.CPUMilli &&
+			used.MemBytes+req.MemBytes <= s.node.Allocatable.MemBytes
+	})
+}
+
+func (c *Cluster) unschedulableCountLocked() int {
+	count := 0
+	for _, p := range c.backlog {
+		if p.Unschedulable {
+			count++
+		}
+	}
+	return count
+}
+
 func (c *Cluster) churnLocked() {
 	n := c.pickLocked(func(s *simNode) bool { return !s.draining && s.node.Phase == model.PhaseReady })
 	if n == nil {
@@ -405,6 +562,17 @@ func (c *Cluster) drainOneLocked() {
 	n.node.Phase = model.PhaseDraining
 	n.node.Schedulable = false
 	n.node.Message = "disrupted: underutilized"
+	// A blocked disruption before the successful one is worth simulating: it is
+	// the most common warning on a real node's history, and it is what the pane
+	// exists to surface.
+	if c.rng.Float64() < 0.35 {
+		c.recordLocked(n, "NodeClaim", "Warning", "DisruptionBlocked", "karpenter",
+			"Cannot disrupt NodeClaim: pdb shop/checkout prevents pod evictions")
+	}
+	c.recordLocked(n, "NodeClaim", "Normal", "DisruptionTerminating", "karpenter",
+		"Disrupting NodeClaim: Underutilized/Delete")
+	c.recordLocked(n, "Node", "Normal", "NodeNotSchedulable", "kubelet",
+		fmt.Sprintf("Node %s status is now: NodeNotSchedulable", n.node.Name))
 	jitter := time.Duration(c.rng.Int63n(int64(c.opts.DrainFor/2) + 1))
 	n.deleteAt = time.Now().Add(c.opts.DrainFor + jitter)
 	c.publishLocked(n)
@@ -416,6 +584,8 @@ func (c *Cluster) stepDrainLocked(n *simNode, now time.Time) {
 	for key, p := range n.pods {
 		if p.Phase != model.PodTerminating {
 			p.Phase = model.PodTerminating
+			c.recordLocked(n, "Node", "Normal", "Evicting", "karpenter",
+				fmt.Sprintf("Evicted pod %s", key))
 			c.store.UpsertPod(p)
 			c.publishLocked(n)
 			return
@@ -428,9 +598,13 @@ func (c *Cluster) stepDrainLocked(n *simNode, now time.Time) {
 		}
 	}
 	if now.After(n.deleteAt) {
-		if n.node.Phase != model.PhaseDeleting {
-			n.node.Phase = model.PhaseDeleting
+		if n.node.Phase != model.PhaseTerminating {
+			n.node.Phase = model.PhaseTerminating
 			n.node.Message = "terminating"
+			c.recordLocked(n, "NodeClaim", "Normal", "Terminating", "karpenter",
+				fmt.Sprintf("Terminating instance %s", n.node.InstanceType))
+			c.recordLocked(n, "Node", "Normal", "RemovingNode", "node-controller",
+				fmt.Sprintf("Node %s event: Removing Node %s from Controller", n.node.Name, n.node.Name))
 			c.publishLocked(n)
 			return
 		}

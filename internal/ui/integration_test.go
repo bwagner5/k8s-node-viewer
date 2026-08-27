@@ -8,6 +8,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/oxidecomputer/k8s-node-viewer/internal/model"
 	"github.com/oxidecomputer/k8s-node-viewer/internal/source/fake"
 )
 
@@ -22,7 +23,7 @@ func TestEndToEnd(t *testing.T) {
 	cluster, store := fake.New(fake.Options{Nodes: 10, Seed: 42, DrainFor: 200 * time.Millisecond})
 	snaps := store.Watch(ctx, 20*time.Millisecond)
 
-	m := New(Config{Snapshots: snaps, Demo: cluster, FPS: 20, Legend: true, HasMetrics: true})
+	m := New(Config{Snapshots: snaps, Demo: cluster, FPS: 20, Legend: true})
 	run(t, m, tea.WindowSizeMsg{Width: 150, Height: 42})
 
 	// Drive the simulation and the event loop together for a while, exercising
@@ -74,7 +75,7 @@ func TestEndToEnd(t *testing.T) {
 	}
 	m.derive()
 	for _, v := range m.vis {
-		if v.node.NodePool != "general" && v.node.Phase.String() != "Gone" {
+		if v.node.NodePool != "general" && v.node.Phase != model.PhaseGone {
 			t.Fatalf("node %s survived the nodepool filter", v.node.Name)
 		}
 	}
@@ -84,6 +85,69 @@ func TestEndToEnd(t *testing.T) {
 	if !quits(t, m) {
 		t.Fatal("q did not return tea.Quit")
 	}
+}
+
+// TestDetailPaneAgainstSimulatedCluster drives the pane through the real wiring:
+// simulated source as the Describer, its own recorded history, no stubs. It is
+// what catches the pane being connected to nothing.
+func TestDetailPaneAgainstSimulatedCluster(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cluster, store := fake.New(fake.Options{Nodes: 8, Seed: 21})
+	snaps := store.Watch(ctx, 20*time.Millisecond)
+
+	m := New(Config{Snapshots: snaps, Demo: cluster, Describe: cluster, FPS: 20, Legend: true})
+	run(t, m, tea.WindowSizeMsg{Width: 150, Height: 44})
+
+	// The simulation seeds itself when it starts running, so wait for a snapshot
+	// that has nodes in it rather than for the first one.
+	go func() { _ = cluster.Run(ctx) }()
+	// Wait for a registered node rather than for any box at all: the first
+	// snapshots can be all provisioning placeholders, and a placeholder has no
+	// kubelet history to assert on.
+	deadline := time.Now().Add(3 * time.Second)
+	ready := -1
+	for ready < 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("no ready node to describe")
+		}
+		run(t, m, snapshotMsg{<-snaps})
+		for i, v := range m.vis {
+			if v.node.Phase == model.PhaseReady {
+				ready = i
+				break
+			}
+		}
+	}
+
+	m.setCursor(ready)
+	name := m.cursorName
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("enter did not start a fetch against the simulated source")
+	}
+	run(t, m, cmd())
+
+	if m.detail == nil || m.detail.detail == nil {
+		t.Fatalf("pane has no detail: %+v", m.detail)
+	}
+	if m.detail.err != nil {
+		t.Fatalf("fetch failed: %v", m.detail.err)
+	}
+	out := m.View()
+	for _, want := range []string{name, "EVENTS", "Launched", "NodeReady", "CONDITIONS"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("pane is missing %q\n%s", want, out)
+		}
+	}
+	assertFrame(t, m, 150, 44, m.mode, len(m.vis), "simulated detail")
+
+	run(t, m, tea.KeyMsg{Type: tea.KeyEsc})
+	if m.detail != nil {
+		t.Fatal("esc did not close the pane")
+	}
+	assertFrame(t, m, 150, 44, m.mode, len(m.vis), "back to the grid")
 }
 
 // run feeds one message through Update. The returned command is discarded: the

@@ -155,6 +155,66 @@ func (c *canvas) hMeterTip(x, y, w int, frac float64, on, off lipgloss.Color) {
 	}
 }
 
+// Rail glyphs: a full lower half-block, and a lower-left quadrant for the
+// sub-cell remainder so a rail animates as smoothly as a background fill.
+const (
+	railCell = '▄'
+	railHalf = '▖'
+)
+
+// hMeterRail paints a horizontal gauge as a half-height bar — the fill sits in
+// the lower half of the row and whatever background is already there shows
+// through above it.
+//
+// This is what makes stacked meters legible. Two background fills on adjacent
+// rows merge into a single two-row block of two colours, a shape that reads as
+// neither bar, and a terminal has no sub-row geometry to separate them with.
+// Drawing the bar as a glyph instead gives it a top edge, and that edge is the
+// separation: the row above is now visibly a different bar.
+//
+// The cost is that nothing may be drawn on top — a label would replace the
+// glyph and punch a hole in the bar — so callers put their text beside the
+// meter rather than inside it. Where text has to sit on the meter (the node
+// cards, which have no room beside it), the background fill of hMeter is still
+// the right primitive: the text itself breaks the colour up.
+func (c *canvas) hMeterRail(x, y, w int, frac float64, on, off lipgloss.Color) {
+	if x < 0 {
+		w, x = w+x, 0
+	}
+	if w <= 0 || x >= c.w || y < 0 || y >= c.h {
+		return
+	}
+	w = min(w, c.w-x)
+	exact := clamp01(frac) * float64(w)
+	full := int(exact)
+	for i := 0; i < w; i++ {
+		cl := c.at(x+i, y)
+		cl.r, cl.bold = railCell, false
+		if i < full {
+			cl.fg = on
+		} else {
+			cl.fg = off
+		}
+	}
+	if rem := exact - float64(full); rem >= 0.25 && full < w {
+		cl := c.at(x+full, y)
+		cl.r, cl.fg = railHalf, on
+	}
+}
+
+// recolorRail repaints the first w cells of a rail, for a meter whose fill is
+// made of more than one segment.
+func (c *canvas) recolorRail(x, y, w int, fg lipgloss.Color) {
+	for i := 0; i < w; i++ {
+		if !c.inBounds(x+i, y) {
+			continue
+		}
+		if cl := c.at(x+i, y); cl.r == railCell || cl.r == railHalf {
+			cl.fg = fg
+		}
+	}
+}
+
 // vMeter fills the rect from the bottom up. Used for the big node-only mode
 // where the whole box is one utilisation gauge.
 func (c *canvas) vMeter(x, y, w, h int, frac float64, on, off lipgloss.Color) {

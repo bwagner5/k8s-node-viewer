@@ -26,14 +26,16 @@ const (
 	PhaseCordoned
 	// PhaseDraining is cordoned plus an active disruption/deletion signal.
 	PhaseDraining
-	// PhaseDeleting means a deletionTimestamp is set on the Node or NodeClaim.
-	PhaseDeleting
+	// PhaseTerminating means a deletionTimestamp is set on the Node or NodeClaim.
+	// Kubernetes is deleting the object, but "terminating" describes the
+	// observable state and matches the vocabulary used for pods.
+	PhaseTerminating
 	// PhaseGone is a tombstone: the object is out of the informer cache and we
 	// are holding it briefly so the UI can animate it away.
 	PhaseGone
 )
 
-var phaseNames = [...]string{"Provisioning", "NotReady", "Ready", "Cordoned", "Draining", "Deleting", "Gone"}
+var phaseNames = [...]string{"Provisioning", "NotReady", "Ready", "Cordoned", "Draining", "Terminating", "Removed"}
 
 func (p Phase) String() string {
 	if int(p) < len(phaseNames) {
@@ -45,6 +47,15 @@ func (p Phase) String() string {
 // Terminal reports whether the node is on its way out. Used to pick animations
 // and to exclude the node from "healthy capacity" totals.
 func (p Phase) Terminal() bool { return p >= PhaseDraining }
+
+// PhaseTransition is one phase the store observed and when it observed it.
+// Transitions are recorded before snapshot coalescing, so a fast live sequence
+// such as Cordoned -> Draining is still available to the renderer even when no
+// frame was emitted for the intermediate state.
+type PhaseTransition struct {
+	Phase Phase
+	At    time.Time
+}
 
 // PodPhase is a flattened pod state; Terminating is not a real Kubernetes pod
 // phase but is what an operator actually wants to see.
@@ -107,12 +118,18 @@ type Pod struct {
 	// Owner is the controller name (ReplicaSet collapsed to its Deployment)
 	// and is what the pod-cell colours hash on, so one workload reads as one
 	// colour across the cluster.
-	Owner    string
-	Requests Resources
-	Limits   Resources
-	Usage    Resources
-	HasUsage bool
-	Created  time.Time
+	Owner string
+	// Unschedulable means the scheduler has actively refused this pod
+	// (PodScheduled=False, reason Unschedulable) rather than simply not having
+	// got round to it. That distinction is the whole point of tracking pending
+	// pods: one waiting a beat is normal, one the scheduler has rejected is a
+	// capacity problem, and only the second is what a provisioner reacts to.
+	Unschedulable bool
+	Requests      Resources
+	Limits        Resources
+	Usage         Resources
+	HasUsage      bool
+	Created       time.Time
 }
 
 func (p *Pod) Key() string { return p.Namespace + "/" + p.Name }
@@ -127,9 +144,17 @@ type Node struct {
 	CapacityType string // "spot" / "on-demand"
 	NodePool     string // karpenter.sh/nodepool
 	NodeClaim    string
-	Ready        bool
-	Schedulable  bool
-	Phase        Phase
+	// ProviderID is the cloud instance ID ("aws:///us-west-2a/i-0abc"). It is the
+	// only field a Node and its NodeClaim share from the moment each is created,
+	// which makes it the key that joins a provisioning placeholder to the real
+	// node without waiting on Karpenter to write status.nodeName.
+	ProviderID  string
+	Ready       bool
+	Schedulable bool
+	Phase       Phase
+	// Transitions is a short, ordered observation history ending at Phase. It is
+	// display evidence, not a delay: Phase always remains the latest cluster fact.
+	Transitions []PhaseTransition
 	// Message is a short human reason for the current phase, shown on the
 	// selected node's detail line ("disrupted: underutilized").
 	Message string
@@ -147,32 +172,68 @@ type Node struct {
 	Price    float64
 	HasPrice bool
 
+	// Consolidatable is Karpenter's latest word on whether this node could be
+	// removed, ConsolidationReason is the message behind it, and ConsolidationAt
+	// is when it said so. See the Consolidation type: this is a reported fact
+	// with an age, not a computed one.
+	Consolidatable      Consolidation
+	ConsolidationReason string
+	ConsolidationAt     time.Time
+
 	Labels map[string]string
 	Pods   []*Pod
 }
 
-// Util returns the fractions the UI draws, honouring the requested basis and
-// silently falling back to requests when metrics-server has not reported yet.
-func (n *Node) Util(basis Basis) (cpu, mem float64) {
-	if basis == BasisUsage && n.HasUsage {
-		return n.Usage.Frac(n.Allocatable)
-	}
+// Util returns the request fractions the UI draws. Requests are the scheduler's
+// input, so the capacity view has one fixed meaning rather than a configurable
+// interpretation.
+func (n *Node) Util() (cpu, mem float64) {
 	return n.Requests.Frac(n.Allocatable)
 }
 
-// Basis selects which numbers drive the meters.
-type Basis int
+// Consolidation is whether Karpenter considers a node removable.
+//
+// There is no field for this anywhere in the API. The decision lives in
+// Karpenter's disruption loop and surfaces only as an event — ConsolidationCandidate
+// when a node is a candidate for removal, Unconsolidatable when it looked and
+// could not. So this is a *reported* fact with an age rather than a computed one,
+// which is why it carries a timestamp, expires after ConsolidationTTL, and has an
+// unknown state that means "Karpenter has not said" rather than "no".
+type Consolidation int
 
 const (
-	BasisRequests Basis = iota
-	BasisUsage
+	ConsolidationUnknown Consolidation = iota
+	ConsolidationYes
+	ConsolidationNo
 )
 
-func (b Basis) String() string {
-	if b == BasisUsage {
-		return "usage"
+// ConsolidationTTL is how long a verdict is trusted. Karpenter re-evaluates
+// continuously and re-emits, so silence for this long means the last verdict is
+// no longer evidence of anything — and a stale "yes" on a node that has since
+// filled up would be worse than admitting we do not know.
+const ConsolidationTTL = 30 * time.Minute
+
+func (c Consolidation) String() string {
+	switch c {
+	case ConsolidationYes:
+		return "yes"
+	case ConsolidationNo:
+		return "no"
+	default:
+		return "unknown"
 	}
-	return "requests"
+}
+
+// Short is the single cell the dense table draws: y, n, or a dot for unknown.
+func (c Consolidation) Short() string {
+	switch c {
+	case ConsolidationYes:
+		return "y"
+	case ConsolidationNo:
+		return "n"
+	default:
+		return "·"
+	}
 }
 
 // NodePool is the subset of a Karpenter NodePool we display and filter on.
@@ -191,11 +252,9 @@ type Snapshot struct {
 	Taken      time.Time
 	Nodes      []*Node
 	NodePools  []*NodePool
-	Namespaces []string
 	// Totals covers every non-tombstoned node, before UI filters.
 	Totals       Totals
 	HasKarpenter bool
-	HasMetrics   bool
 	Context      string
 }
 
@@ -207,6 +266,12 @@ type Totals struct {
 	Requests    Resources
 	Usage       Resources
 	HourlyCost  float64
+	// Pending counts pods that exist but have no node, and Unschedulable the
+	// subset the scheduler has refused outright. Neither is counted in Pods:
+	// that is what is actually placed, and a backlog is precisely the thing
+	// that is not.
+	Pending       int
+	Unschedulable int
 }
 
 // HumanMem renders bytes with binary units at demo-legible precision.
@@ -240,10 +305,22 @@ func HumanCPU(m int64) string {
 	return fmt.Sprintf("%.1f", v)
 }
 
-// HumanAge renders a duration in the two-character-ish style kubectl uses.
+// secondsUntil is where HumanAge stops counting seconds and starts counting
+// minutes. kubectl switches at 60s; this tool holds on to seconds until 100
+// because the thing it exists to show — an instance going from launched to
+// Ready — takes about ninety of them. "1m" for the last ten seconds of that
+// wait throws away the only resolution that matters, and by the time a node is
+// past it nobody is reading the age to the second anyway.
+const secondsUntil = 100 * time.Second
+
+// HumanAge renders a duration in the two-character-ish style kubectl uses,
+// except for the seconds range — see secondsUntil.
 func HumanAge(d time.Duration) string {
 	switch {
-	case d < time.Minute:
+	case d < secondsUntil:
+		if d < 0 {
+			d = 0
+		}
 		return fmt.Sprintf("%ds", int(d.Seconds()))
 	case d < time.Hour:
 		return fmt.Sprintf("%dm", int(d.Minutes()))

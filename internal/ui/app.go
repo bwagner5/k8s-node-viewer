@@ -17,9 +17,17 @@ import (
 // messageTTL is how long a status message stays up.
 const messageTTL = 4 * time.Second
 
+// seekOverlayTTL is intentionally brief: long enough to register like a video
+// player's seek feedback, short enough not to cover the cluster being reviewed.
+const seekOverlayTTL = 1500 * time.Millisecond
+
 // idleFPS is the tick rate when nothing is animating. Dropping to it keeps an
 // idle viewer off the CPU while still refreshing ages and pulses.
 const idleFPS = 4
+
+// One keypress should move far enough to recover a missed transition without
+// making a short lifecycle jump all the way out of view.
+const keyRewindStep = 5 * time.Second
 
 // Demo is the optional interactive control surface. Only the simulated source
 // implements it; against a real cluster this is nil and the demo commands are
@@ -28,6 +36,7 @@ type Demo interface {
 	ScaleUp(n int)
 	DrainOne()
 	Churn()
+	Burst(n int)
 }
 
 // Config is everything the UI needs at construction.
@@ -35,13 +44,22 @@ type Config struct {
 	Snapshots <-chan *model.Snapshot
 	Demo      Demo
 	FPS       int
-	Mode      Mode
-	Basis     model.Basis
-	Sort      SortKey
-	Filter    Filter
-	Legend    bool
-	// HasMetrics gates the usage basis; set from source capability discovery.
-	HasMetrics bool
+	// PlaybackSpeed is the initial cluster timeline rate. One starts live;
+	// values below one start buffered playback, and zero starts paused.
+	PlaybackSpeed float64
+	PlaybackSet   bool
+	// HistoryDuration and HistoryMemory bound both delayed snapshots waiting to
+	// be replayed and the short rolling rewind window. Zero values select
+	// presentation-friendly defaults.
+	HistoryDuration time.Duration
+	HistoryMemory   int64
+	Mode            Mode
+	Sort            SortKey
+	Filter          Filter
+	Legend          bool
+	// Describe backs the node detail pane. Nil degrades the pane to snapshot
+	// data with a note that events need a source, rather than disabling it.
+	Describe Describer
 }
 
 // Model is the bubbletea model.
@@ -61,16 +79,34 @@ type Model struct {
 	snap  *model.Snapshot
 	reg   *anim.Registry
 	fleet *anim.Track
+	// pend smooths the pending meter. It borrows a Track's two value slots for
+	// the two segments of one bar: CPU carries the whole backlog, Mem the
+	// unschedulable part of it.
+	pend *anim.Track
 
 	mode       Mode
 	zoom       int
-	basis      model.Basis
 	sortKey    SortKey
 	sortDesc   bool
 	filter     Filter
 	showLegend bool
 	showHelp   bool
 	helpScroll int
+	// detail is the node describe pane, nil when the grid is showing. It holds
+	// every scrap of state the pane needs, so closing it restores the grid
+	// exactly — there is nothing else to put back.
+	detail                 *detailView
+	describe               Describer
+	playback               *playback
+	detailHistory          map[string][]detailSample
+	detailHistoryBytes     int64
+	detailCaptureAt        time.Time
+	detailCapturing        bool
+	detailHistoryExhausted bool
+	detailHistoryEpoch     uint64
+	// pendingCmd carries a command produced inside a command-registry callback
+	// back to execute, whose signature is the Bubble Tea integration boundary.
+	pendingCmd tea.Cmd
 	// Wheel-zoom gesture state: wheelAccum banks notches between zoom levels,
 	// wheelAt separates one flick from the next, and anchorX/anchorY are where
 	// the pointer was when the current anchor was chosen — the zoom re-aims when
@@ -85,14 +121,17 @@ type Model struct {
 	// of that too, walking off the card the pointer is on.
 	anchorName string
 	// lastMouse is the most recent mouse event, kept only for the debug readout.
-	lastMouse  string
-	hasMetrics bool
-	demo       Demo
+	lastMouse string
+	demo      Demo
 
 	bar    cmdBar
 	msg    string
 	msgErr bool
 	msgAt  time.Time
+	// seekOverlay is the accumulated distance from consecutive [ presses while
+	// the video-player-style feedback remains on screen.
+	seekOverlay   time.Duration
+	seekOverlayAt time.Time
 
 	// cursorName tracks the selection by identity, so re-sorting or a scale
 	// event does not move the highlight off the node you were pointing at.
@@ -121,20 +160,28 @@ func New(cfg Config) *Model {
 	if cfg.FPS <= 0 {
 		cfg.FPS = 20
 	}
+	initialSpeed := cfg.PlaybackSpeed
+	if !cfg.PlaybackSet {
+		// Config's zero value preserves the historical default: live. Starting
+		// paused is available through :speed 0 once the program is running.
+		initialSpeed = 1
+	}
 	return &Model{
-		cfg:        cfg,
-		snaps:      cfg.Snapshots,
-		snap:       &model.Snapshot{},
-		reg:        anim.NewRegistry(),
-		fleet:      &anim.Track{},
-		mode:       cfg.Mode,
-		basis:      cfg.Basis,
-		sortKey:    cfg.Sort,
-		filter:     cfg.Filter,
-		showLegend: cfg.Legend,
-		hasMetrics: cfg.HasMetrics,
-		demo:       cfg.Demo,
-		last:       time.Now(),
+		cfg:           cfg,
+		snaps:         cfg.Snapshots,
+		snap:          &model.Snapshot{},
+		reg:           anim.NewRegistry(),
+		fleet:         &anim.Track{},
+		pend:          &anim.Track{},
+		mode:          cfg.Mode,
+		sortKey:       cfg.Sort,
+		filter:        cfg.Filter,
+		showLegend:    cfg.Legend,
+		demo:          cfg.Demo,
+		describe:      cfg.Describe,
+		playback:      newPlayback(initialSpeed, cfg.HistoryDuration, cfg.HistoryMemory),
+		detailHistory: map[string][]detailSample{},
+		last:          time.Now(),
 	}
 }
 
@@ -211,7 +258,10 @@ func (m *Model) waitSnapshot() tea.Cmd {
 // moving.
 func (m *Model) tick() tea.Cmd {
 	fps := m.cfg.FPS
-	if !m.reg.Busy() {
+	// A delayed timeline needs the full frame cadence even between animations:
+	// snapshots can be only 100ms apart, and an idle 4fps tick would apply
+	// several before one render and hide the very transitions playback preserves.
+	if (!m.reg.Busy() && m.playback.live) || (!m.playback.live && m.playback.speed == 0) {
 		fps = idleFPS
 	}
 	return tea.Tick(time.Second/time.Duration(fps), func(t time.Time) tea.Msg { return frameMsg(t) })
@@ -231,21 +281,67 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case snapshotMsg:
-		m.applySnapshot(msg.snap)
-		return m, m.waitSnapshot()
+		wallNow := time.Now()
+		var cmds []tea.Cmd
+		cmds = append(cmds, m.waitSnapshot())
+		for _, snap := range m.playback.Ingest(msg.snap, wallNow) {
+			cmds = append(cmds, m.applySnapshot(snap))
+		}
+		if m.playback.OverLimit(wallNow) {
+			cmds = append(cmds, m.goRealtime("playback history limit reached — returned to realtime"))
+		}
+		return m, tea.Batch(cmds...)
 
 	case frameMsg:
 		now := time.Time(msg)
-		dt := now.Sub(m.last)
-		// Clamp dt so a suspended terminal does not fast-forward every
-		// animation to completion on resume.
-		if dt > 250*time.Millisecond {
-			dt = 250 * time.Millisecond
+		wallDT := now.Sub(m.last)
+		if wallDT < 0 {
+			wallDT = 0
 		}
 		m.last = now
-		m.reg.Advance(dt)
-		m.fleet.Step(dt)
-		return m, m.tick()
+		// Playback is a clock, so it must receive the complete elapsed wall time.
+		// Losing the tail of a late frame would make a requested 0.5x rate slower
+		// than 0.5x and inflate the reported distance behind realtime.
+		playbackDT := wallDT
+		// Clamp dt so a suspended terminal does not fast-forward every
+		// animation to completion on resume. This clamp belongs only to visual
+		// interpolation; it must never alter the cluster timeline above.
+		if wallDT > 250*time.Millisecond {
+			wallDT = 250 * time.Millisecond
+		}
+		var cmds []tea.Cmd
+		for _, snap := range m.playback.Advance(playbackDT, now) {
+			cmds = append(cmds, m.applySnapshot(snap))
+		}
+		if m.playback.OverLimit(now) {
+			cmds = append(cmds, m.goRealtime("playback history limit reached — returned to realtime"))
+		}
+		clusterDT := wallDT
+		if !m.playback.live {
+			clusterDT = time.Duration(float64(wallDT) * m.playback.speed)
+		}
+		m.reg.Advance(clusterDT)
+		m.fleet.Step(clusterDT)
+		m.pend.Step(clusterDT)
+		// The frame tick is also what paces the detail pane's refresh: events
+		// arrive while you are reading them, and a pane that never re-reads shows
+		// a drain that has since finished.
+		if cmd := m.refreshDetail(now); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		if cmd := m.captureDetailHistory(now); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		cmds = append(cmds, m.tick())
+		return m, tea.Batch(cmds...)
+
+	case detailMsg:
+		m.applyDetail(msg)
+		return m, nil
+
+	case detailHistoryMsg:
+		m.applyDetailHistory(msg)
+		return m, nil
 
 	case tea.MouseMsg:
 		cmd := m.handleMouse(msg)
@@ -267,12 +363,27 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // applySnapshot swaps in new facts and reconciles the animation registry against
 // them. Filters deliberately play no part here: hiding a node must not make it
 // animate away, or unhiding it would replay its entrance.
-func (m *Model) applySnapshot(snap *model.Snapshot) {
+//
+// It returns the fetch an open detail pane needs when the node it is describing
+// has changed identity under it — see followHandover.
+func (m *Model) applySnapshot(snap *model.Snapshot) tea.Cmd {
+	previous := make(map[string]model.Phase, len(m.snap.Nodes))
+	for _, n := range m.snap.Nodes {
+		previous[n.Name] = n.Phase
+	}
 	m.snap = snap
+	// Before derive: a NodeClaim becoming a Node renames the thing both the pane
+	// and the cursor are tracking, and derive re-finds the cursor by name. Given
+	// the new name first, it re-finds the right box; given it afterwards, the
+	// cursor has already been reassigned to whatever inherited the old index.
+	cmd := m.followHandover()
 	m.reg.BeginSync()
 	for _, n := range snap.Nodes {
 		track := m.reg.Node(n.Name)
-		if n.Phase == model.PhaseGone {
+		if phase, existed := previous[n.Name]; existed && phase != n.Phase {
+			track.Notify()
+		}
+		if removalReadyToCollapse(n, m.displayNow()) {
 			track.SetLeaving()
 		}
 		for _, p := range n.Pods {
@@ -281,6 +392,8 @@ func (m *Model) applySnapshot(snap *model.Snapshot) {
 	}
 	m.reg.EndSync()
 	m.derive()
+	m.refreshHistoricalDetail()
+	return cmd
 }
 
 // derive recomputes the filtered, sorted node list and the grid geometry. It is
@@ -651,38 +764,93 @@ func (m *Model) snapshotPools() []string {
 	return out
 }
 
-func (m *Model) snapshotNamespaces() []string { return m.snap.Namespaces }
-
-func (m *Model) snapshotOwners() []string {
-	seen := map[string]bool{}
-	var out []string
-	for _, n := range m.snap.Nodes {
-		for _, p := range n.Pods {
-			if p.Owner != "" && !seen[p.Owner] {
-				seen[p.Owner] = true
-				out = append(out, p.Owner)
-			}
-		}
-	}
-	sort.Strings(out)
-	return out
-}
-
-func (m *Model) snapshotInstanceTypes() []string {
-	seen := map[string]bool{}
-	var out []string
-	for _, n := range m.snap.Nodes {
-		if n.InstanceType != "" && !seen[n.InstanceType] {
-			seen[n.InstanceType] = true
-			out = append(out, n.InstanceType)
-		}
-	}
-	sort.Strings(out)
-	return out
-}
-
 func (m *Model) notify(msg string, isErr bool) {
 	m.msg, m.msgErr, m.msgAt = msg, isErr, time.Now()
+}
+
+func (m *Model) displayNow() time.Time { return m.playback.DisplayNow(time.Now()) }
+
+func (m *Model) setPlaybackSpeed(speed float64) error {
+	wasLive := m.playback.live
+	now := time.Now()
+	if err := m.playback.SetSpeed(speed, now); err != nil {
+		return err
+	}
+	if wasLive {
+		m.clearDetailHistory()
+		m.detailHistoryExhausted = false
+		m.seedOpenDetailHistory(now)
+	}
+	return nil
+}
+
+func (m *Model) togglePause() {
+	wasLive := m.playback.live
+	now := time.Now()
+	m.playback.TogglePause(now)
+	if wasLive {
+		m.clearDetailHistory()
+		m.detailHistoryExhausted = false
+		m.seedOpenDetailHistory(now)
+	}
+	m.notify(playbackStatus(m.playback, now), false)
+}
+
+func (m *Model) rewindPlayback(amount time.Duration) (tea.Cmd, time.Duration) {
+	wasLive := m.playback.live
+	snap, moved := m.playback.Rewind(amount, time.Now())
+	if snap == nil || moved <= 0 {
+		return nil, 0
+	}
+	if wasLive {
+		// List snapshots are cheap enough to retain continuously. Describe data
+		// requires API calls per node, so it begins sampling only once playback is
+		// delayed; a detail pane honestly labels itself live until a sample exists.
+		m.clearDetailHistory()
+		m.detailHistoryExhausted = false
+	}
+	// A rewind is a seek, not an animation. Throw away interpolation from the
+	// newer frame so cards and meters land atomically on the selected snapshot;
+	// playback speed applies only to movement after this point.
+	m.reg = anim.NewRegistry()
+	m.fleet = &anim.Track{}
+	m.pend = &anim.Track{}
+	cmd := m.applySnapshot(snap)
+	m.reg.Advance(anim.ExitDur)
+	if d := m.detail; d != nil {
+		if detail, at, ok := m.historicalDetail(d.name, d.claim, d.providerID); ok {
+			d.detail, d.sampleAt = detail, at
+			d.historical, d.liveFallback, d.forceLive, d.loading = true, false, false, false
+		} else {
+			d.historical, d.liveFallback, d.forceLive = false, true, false
+			d.sampleAt = time.Time{}
+		}
+	}
+	return cmd, moved
+}
+
+// goRealtime is the one operation that discards history. Setting speed to 1x
+// intentionally does not call it: that plays forward normally from the current
+// delayed frame and keeps the existing lag.
+func (m *Model) goRealtime(message string) tea.Cmd {
+	wasLive := m.playback.live
+	now := time.Now()
+	snap := m.playback.GoLive(now)
+	m.clearDetailHistory()
+	m.detailHistoryExhausted = false
+	if message == "" {
+		message = playbackStatus(m.playback, now)
+	}
+	m.notify(message, strings.Contains(message, "limit"))
+	var cmds []tea.Cmd
+	if !wasLive && snap != nil && (m.snap == nil || snap.Generation != m.snap.Generation) {
+		cmds = append(cmds, m.applySnapshot(snap))
+	}
+	if !wasLive && m.detail != nil && m.describe != nil {
+		m.detail.historical, m.detail.liveFallback, m.detail.forceLive, m.detail.loading = false, false, false, true
+		cmds = append(cmds, m.fetchDetail(m.detail.name, m.detail.claim))
+	}
+	return tea.Batch(cmds...)
 }
 
 // --- View ---
@@ -694,15 +862,19 @@ func (m *Model) View() string {
 	if m.quitting {
 		return ""
 	}
+	// The detail pane comes first, matching the key router: while it is up it owns
+	// the screen and the keyboard both.
+	if m.detail != nil {
+		return m.renderSeekOverlay(m.renderDetail(m.w, m.h), m.w, m.h)
+	}
 	if m.showHelp {
-		return m.renderHelp(m.w, m.h)
+		return m.renderSeekOverlay(m.renderHelp(m.w, m.h), m.w, m.h)
 	}
 
 	ctx := boxCtx{
-		reg:     m.reg,
-		basis:   m.basis,
-		mode:    m.mode,
-		dimPods: m.filter.Namespace != "" || m.filter.Owner != "",
+		reg:  m.reg,
+		mode: m.mode,
+		now:  m.displayNow(),
 	}
 
 	f := m.layoutFrame()
@@ -737,5 +909,5 @@ func (m *Model) View() string {
 	for len(lines) < m.h {
 		lines = append(lines, padRow("", m.w))
 	}
-	return strings.Join(lines[:m.h], "\n")
+	return m.renderSeekOverlay(strings.Join(lines[:m.h], "\n"), m.w, m.h)
 }

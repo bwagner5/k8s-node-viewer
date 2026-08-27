@@ -14,10 +14,9 @@ import (
 	"github.com/oxidecomputer/k8s-node-viewer/internal/theme"
 )
 
-// The bug these guard against: the legend drew *border* phase colours as solid
-// blocks, which is exactly what a pod cell looks like, while pod cells were
-// coloured by an unexplained hash of the workload name. Pod cells now carry one
-// meaning only — state — and the legend states it.
+// The bug these guard against: tiny phase swatches required matching a hairline
+// colour to a card border. Nodes now use labelled status chips, while pod cells
+// carry one meaning only — state — and the legend mirrors both directly.
 
 func TestEveryPodStateHasALegendEntry(t *testing.T) {
 	labelled := map[string]bool{}
@@ -33,13 +32,13 @@ func TestEveryPodStateHasALegendEntry(t *testing.T) {
 
 func TestPodGlyphAndColourAgreeWithLegend(t *testing.T) {
 	m := newTestModel(t, 200, 44, 8)
-	ctx := boxCtx{reg: m.reg, basis: m.basis, mode: m.mode}
+	ctx := boxCtx{reg: m.reg, mode: m.mode}
 	byLabel := map[string]rune{}
 	for _, st := range podStates {
 		byLabel[st.label] = st.glyph
 	}
 	for _, v := range m.vis {
-		for i, p := range v.pods {
+		for _, p := range v.pods {
 			label := strings.ToLower(p.Phase.String())
 			if got := podGlyph(p); got != byLabel[label] {
 				t.Fatalf("pod %s (%s) draws glyph %q, legend shows %q", p.Name, label, got, byLabel[label])
@@ -48,7 +47,7 @@ func TestPodGlyphAndColourAgreeWithLegend(t *testing.T) {
 				continue // pending/terminating animate away from the flat colour
 			}
 			m.reg.Pod(p.Key()).Enter = 1
-			if got := podColor(p, v.matched[i], ctx); got != stateColor(label) {
+			if got := podColor(p, ctx); got != stateColor(label) {
 				t.Fatalf("running pod %s renders %s, legend shows %s", p.Name, got, stateColor(label))
 			}
 		}
@@ -70,8 +69,8 @@ func TestPodPaletteDoesNotCollideWithPhaseColours(t *testing.T) {
 					continue // grey; pods are never grey unless dimmed
 				}
 				// Terminating pods and dying nodes are meant to rhyme, and a
-				// failed pod sharing the deleting red is a feature, not a clash.
-				if (name == "terminating" || name == "failed") && (p == model.PhaseDeleting || p == model.PhaseDraining) {
+				// failed pod sharing the terminating red is a feature, not a clash.
+				if (name == "terminating" || name == "failed") && (p == model.PhaseTerminating || p == model.PhaseDraining) {
 					continue
 				}
 				if d := colorDistance(t, pod, string(phase)); d < 0.14 {
@@ -94,14 +93,22 @@ func TestLegendIsTwoLabelledRows(t *testing.T) {
 			t.Errorf("legend row %d is not labelled %q: %q", i, want, rows[i])
 		}
 	}
-	// Phase swatches must be border glyphs, never the solid block a pod cell
-	// uses — that conflation is what made the colours unreadable.
+	// Phase chips must name the state directly and remain distinct from pod-cell
+	// glyphs. Colour is reinforcement, not the decoder.
 	if strings.ContainsRune(rows[0], glyphRunning) {
 		t.Errorf("node row uses the pod-cell glyph: %q", rows[0])
 	}
+	for _, want := range []string{"DRAINING", "TERMINATING", "CORDONED"} {
+		if !strings.Contains(rows[0], want) {
+			t.Errorf("node row is missing labelled chip %q: %q", want, rows[0])
+		}
+	}
 	for _, st := range podStates {
-		if !strings.Contains(rows[1], st.label) {
+		if !strings.Contains(strings.ToLower(rows[1]), st.label) {
 			t.Errorf("pod row is missing %q: %q", st.label, rows[1])
+		}
+		if !strings.ContainsRune(rows[1], st.marker) {
+			t.Errorf("pod row is missing %q marker %q: %q", st.label, st.marker, rows[1])
 		}
 	}
 }
@@ -112,6 +119,62 @@ func TestReadyBorderIsQuieterThanActivePhases(t *testing.T) {
 	draining := colorDistance(t, string(phaseEdge(model.PhaseDraining)), string(theme.Dark.Card))
 	if ready >= draining {
 		t.Fatalf("ready border (%.3f from card) is not quieter than draining (%.3f)", ready, draining)
+	}
+}
+
+func TestSelectionDoesNotChangePhaseColour(t *testing.T) {
+	m := newTestModel(t, 120, 36, 1)
+	n := &model.Node{Name: "node-a", Phase: model.PhaseDraining}
+	track := m.reg.Node(n.Name)
+	_, plain := borderStyle(n, track, boxCtx{reg: m.reg})
+	_, selected := borderStyle(n, track, boxCtx{reg: m.reg, selected: true})
+	if plain != selected {
+		t.Fatalf("selection changed phase colour from %s to %s", plain, selected)
+	}
+}
+
+func TestRecentPhaseTrailKeepsFastIntermediateState(t *testing.T) {
+	now := time.Now()
+	n := &model.Node{Phase: model.PhaseDraining, Transitions: []model.PhaseTransition{
+		{Phase: model.PhaseReady, At: now.Add(-3 * time.Second)},
+		{Phase: model.PhaseCordoned, At: now.Add(-2 * time.Second)},
+		{Phase: model.PhaseDraining, At: now.Add(-time.Second)},
+	}}
+	if got, want := recentPhaseTrail(n, now, false), "ready → cordoned → draining"; got != want {
+		t.Fatalf("trail = %q, want %q", got, want)
+	}
+	if got := densePhaseState(n, now); !strings.Contains(got, "draining ← cord") {
+		t.Fatalf("dense state lost the prior cordon: %q", got)
+	}
+}
+
+func TestNodeFooterShowsRecentLifecycleWithoutChangingCurrentState(t *testing.T) {
+	now := time.Now()
+	n := &model.Node{
+		Name: "node-a", InstanceType: "m5.large", Phase: model.PhaseDraining,
+		Created: now.Add(-time.Hour), Transitions: []model.PhaseTransition{
+			{Phase: model.PhaseReady, At: now.Add(-3 * time.Second)},
+			{Phase: model.PhaseCordoned, At: now.Add(-2 * time.Second)},
+			{Phase: model.PhaseDraining, At: now.Add(-time.Second)},
+		},
+	}
+	m := newTestModel(t, 80, 24, 0)
+	m.reg.Node(n.Name).Enter = 1
+	box := strings.Join(renderNodeBox(visible{node: n}, 50, 10,
+		boxCtx{reg: m.reg, mode: ModePods, now: now}), "\n")
+	if !strings.Contains(box, "▼ DRAINING") || !strings.Contains(box, "cordoned → draining") {
+		t.Fatalf("card did not preserve current state and recent trail:\n%s", box)
+	}
+}
+
+func TestRemovedNodeRemainsExpandedBeforeExitAnimation(t *testing.T) {
+	now := time.Now()
+	n := &model.Node{Phase: model.PhaseGone, DeletedAt: now}
+	if removalReadyToCollapse(n, now.Add(time.Second)) {
+		t.Fatal("removed node began collapsing before the observation hold elapsed")
+	}
+	if !removalReadyToCollapse(n, now.Add(removedHold)) {
+		t.Fatal("removed node did not begin collapsing after the observation hold")
 	}
 }
 

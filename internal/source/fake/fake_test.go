@@ -199,3 +199,55 @@ func itoa(n int) string {
 	}
 	return string(buf[i:])
 }
+
+// TestBurstFillsThenDrainsTheBacklog walks the sequence the pending meter
+// exists to show: pods arrive with no node, the scheduler gives up on what does
+// not fit, and placing them empties the backlog again.
+func TestBurstFillsThenDrainsTheBacklog(t *testing.T) {
+	// One small node, so a burst cannot possibly all fit.
+	c, store := New(Options{Nodes: 1, Seed: 11})
+	c.seed()
+
+	c.Burst(12)
+	snap := store.Snapshot()
+	if snap.Totals.Pending != 12 {
+		t.Fatalf("pending = %d after a burst of 12, want 12", snap.Totals.Pending)
+	}
+	if snap.Totals.Unschedulable != 0 {
+		t.Fatalf("unschedulable = %d immediately, want 0: the scheduler has not tried yet",
+			snap.Totals.Unschedulable)
+	}
+
+	// Backdate the arrivals rather than sleeping: the wait is a simulated
+	// scheduling cycle, not something a test should sit through.
+	c.mu.Lock()
+	for _, p := range c.backlog {
+		p.Created = p.Created.Add(-2 * unschedulableAfter)
+	}
+	c.mu.Unlock()
+
+	c.step()
+	if got := store.Snapshot().Totals.Unschedulable; got == 0 {
+		t.Fatal("nothing became unschedulable on a full cluster")
+	}
+
+	// Capacity is the answer: scale up and keep ticking until it is absorbed.
+	// The new instances are made to have finished booting, so the test measures
+	// scheduling rather than the simulated launch delay.
+	c.ScaleUp(4)
+	c.mu.Lock()
+	for _, n := range c.nodes {
+		n.readyAt = time.Now().Add(-time.Second)
+	}
+	c.mu.Unlock()
+	deadline := time.Now().Add(5 * time.Second)
+	for store.Snapshot().Totals.Pending > 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("backlog never drained: %d still pending", store.Snapshot().Totals.Pending)
+		}
+		c.step()
+	}
+	if got := store.Snapshot().Totals.Unschedulable; got != 0 {
+		t.Errorf("unschedulable = %d with an empty backlog, want 0", got)
+	}
+}

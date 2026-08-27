@@ -15,7 +15,7 @@ capacity-and-cost framing from
 k9s-style filtering plus animation.
 
 ```
-┏ ip-10-0-4-91 ━━━━━━━ ▼ drain ━┓ ╭ ip-10-0-2-13 ┄┄┄┄┄┄┄┄ ◇ new ┄╮
+┏ ip-10-0-4-91 ━━━━ ▼ DRAINING ━┓ ╭ ip-10-0-2-13 ┄┄ ◇ PROVISIONING ┄╮
 ┃███████▒▒▒▒▒▒▒▒▒▒▒▓▓▓▓▓▓▓▓▓▓▓▓┃ ┊                              ┊
 ┃▓▓▓▓ ╱  ╱  ╱  ╱  ╱  ╱  ╱  ╱  ╱┃ ┊                              ┊
 ┃ ╱  ╱  ╱  ╱  ╱  ╱  ╱  ╱  ╱  ╱ ┃ ┊                              ┊
@@ -31,27 +31,34 @@ go build -o knv ./cmd/knv
 
 ./knv                          # current kube context
 ./knv --context prod --mode nodes
+./knv --price-annotation example.com/hourly-price
 ./knv --demo                   # simulated cluster, no cluster required
+./knv --demo --playback-speed 0.5
 ```
 
 `--demo` runs a self-contained simulation. Use it to rehearse: the seed is
 fixed, so `--demo-seed 42` replays the same cluster every time, and
 `--demo-autopilot=false` keeps the screen still until you trigger events
-yourself with `+` (scale up), `-` (drain) and `x` (churn pods).
+yourself with `+` (scale up), `-` (drain), `x` (churn pods) and `b` (submit a
+burst of pods with no node, which piles up in the pending meter until there is
+somewhere to put them).
 
 ## Keys
 
 | Key | |
 |---|---|
 | `↑↓←→` / `hjkl` | move the selection |
+| `enter` | node details and events; `esc` or `backspace` back |
 | `pgup` `pgdn`, `g` `G` | scroll |
 | `z` / `Z` | zoom in / out; `0` back to fit |
 | `:` | command bar |
 | `/` | filter nodes by name |
 | `\` | clear all filters |
-| `p` | pods ⇄ utilisation-only |
+| `v` | cycle pods → nodes → dense |
+| `p` | pause/resume the cluster timeline |
+| `[` | rewind five seconds (repeat to go farther) |
+| `r` | discard buffered history and jump to real-time |
 | `d` | dense table mode |
-| `u` | meters from requests ⇄ actual usage |
 | `s` / `S` | cycle sort / reverse |
 | `l` | toggle legend |
 | `?` | help (`↑↓` scrolls it; any other key closes) |
@@ -151,27 +158,49 @@ Enter lists the Karpenter NodePools to choose from.
 
 ```
 :nodepool <name|all>        show only nodes from a NodePool     (:np)
-:namespace <name|all>       highlight pods in a namespace       (:ns)
-:owner <substring|all>      highlight pods by controller name   (:app)
 :node <regex|all>           filter nodes by name
-:type <instance-type|all>   filter by instance type
-:capacity <spot|on-demand>  filter by capacity type             (:cap)
-:phase <ready|draining|…>   filter by node phase; repeat to toggle
 :zoom <in|out|fit|max>      card size; max is one node, full screen  (:z)
 :mode <pods|nodes|dense>    change the view                     (:m)
-:pods <on|off>              shorthand for mode pods / mode nodes
-:only <on|off>              hide nodes with no matching pod
-:daemonsets <on|off>        include DaemonSet pods              (:ds)
 :sort <key>                 name, cpu, mem, pods, age, nodepool, type
-:util <requests|usage>      what drives the meters
+:speed <0x…1x|realtime>     cluster playback rate; 0x pauses
+:pause / :resume            pause or resume at the previous rate
+:rewind <duration>          rewind by e.g. 5s or 20s             (:back)
 :theme <dark|light>         palette
 :legend <on|off>            colour legend
+:quit                       exit
 :clear                      drop every filter
+:help                       show help
 ```
 
-Namespace and owner filters **highlight** rather than hide: matching pods keep
-their colour and everything else goes grey, so you can see where a workload
-lives across the whole fleet. `:only on` turns them into hard filters.
+### Slow-motion playback
+
+Playback slows the cluster timeline without slowing the controls. `:speed 0.5x`
+makes observed states and their animations last twice as long; `:speed 0.25x`
+makes them last four times as long. `:speed 1x` continues normally from the
+currently displayed snapshot, preserving the accumulated delay. Use `r` or
+`:speed realtime` to discard the backlog and jump to the newest state.
+
+`p` pauses or resumes at the previous rate. Snapshots continue buffering while
+paused, and the status line shows the playback rate, exact cluster timestamp,
+and precise distance behind the cluster in one readout. Node-detail payloads are
+sampled and buffered alongside the list so opening a node remains aligned with
+the delayed view. If detail history is not available, the pane labels itself as
+live instead of presenting current data as historical.
+
+While the viewer is in real-time it keeps a rolling 30-second snapshot window,
+bounded by the same memory limit. If something flashes past, press `p` and then
+`[` to step back five seconds; repeat `[` or use `:rewind 20s` to go farther.
+Each `[` press shows a brief centred seek badge, with rapid presses accumulating
+the displayed amount just like a video player.
+Press `p` again to replay from there at the previous speed, or `r` to discard the
+backlog and return to the newest state. List snapshots are retained continuously;
+node-detail history still begins sampling only after playback becomes delayed so
+the rewind buffer does not add a stream of API requests per node.
+
+History defaults to ten minutes and approximately 256 MiB. Configure the limits
+with `--history-duration` and `--history-memory`. If the snapshot buffer reaches
+either limit, the viewer returns to real-time with a warning rather than silently
+dropping lifecycle transitions.
 
 ## Modes
 
@@ -180,6 +209,99 @@ lives across the whole fleet. `:only on` turns them into hard filters.
 - **nodes** — no pod cells. The whole box becomes two tall gauges with large
   percentages and a pod count. This is what reads from the back of a room.
 - **dense** — one row per node, for clusters with more nodes than boxes will fit.
+  This is the table, and it carries the `CONS` column (below). Columns are dropped
+  as the terminal narrows, in increasing order of value: nodepool, then instance
+  type, then state, then `CONS`.
+
+### Consolidatable (CONS)
+
+The dense table's `CONS` column is `y` when Karpenter's last word on the node was
+`ConsolidationCandidate` — it is willing to remove this node — `n` when the last
+word was `Unconsolidatable`, and `·` when it has not said. The detail pane shows
+the same verdict with the message and the age behind it.
+
+There is no field for this anywhere in the API. The decision lives in Karpenter's
+disruption loop and surfaces only as an event, so this is a **reported fact with
+an age**, not a computed one. Two consequences worth knowing:
+
+- A verdict expires after 30 minutes of silence and reverts to `·`. Karpenter
+  re-evaluates continuously, so silence that long means the last answer is no
+  longer evidence of anything — and a stale `y` on a node that has since filled up
+  would be worse than admitting we do not know.
+- `·` means *unjudged*, not *no*. A cluster without Karpenter shows `·` on every
+  row, because nothing is making this decision.
+
+Karpenter reports against the NodeClaim it is reasoning about rather than the
+Node, and the event routinely arrives before the Node object does. The store keys
+verdicts by whichever object was named and joins them to nodes when it builds a
+snapshot, taking the more recent of the two; an older verdict never overwrites a
+newer one, which is what stops the column flickering on every informer resync.
+
+### Pending pods
+
+The third header meter is the scheduling backlog: pods that exist and have no
+node. It is the one thing on screen that no node box can show, because a pod with
+nowhere to run is drawn nowhere.
+
+```
+ 14 nodes  cpu ▄▄▄▄▄▄▄▄▄▄▄▄▖▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄  29%  65 / 224
+ $10.75/hr mem ▄▄▄▄▖▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄  11%  100Gi / 896Gi
+          pend ▄▄▄▄▄▄▄▄▄▄▄▄▄▖▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄  32%  28 pending · 7 unschedulable
+```
+
+Two colours, one bar. Amber is *waiting* — normal, and usually gone by the next
+frame. Red is *unschedulable*: the scheduler has looked at the pod and refused
+it (`PodScheduled=False`, reason `Unschedulable`), which is the only signal here
+that means the cluster is out of room. Red is a subset of the bar rather than a
+second bar, so its length is the backlog and the red part is how much of it is
+stuck.
+
+The bar is measured against every pod in the cluster, placed or not, because
+"40 pending" says nothing until you know whether the cluster runs 50 pods or
+5000. Anything non-zero claims at least one cell: a small backlog is small, but
+it must not look like none.
+
+This is the meter to watch during a scale-up: pods go amber, turn red, Karpenter
+answers with a provisioning box in the grid, and the red drains away as the new
+node registers and absorbs them.
+
+### Node details
+
+`enter` opens the selected node's describe pane: what it is, where it is, what it
+reserves, its conditions and taints, the pods on it — and its **events, newest
+first**. That last part is why the pane exists. A node's story is an ordered one
+("launched, registered, went NotReady, was disrupted, evicted eleven pods") and
+the grid can only ever show you the last frame of it. The newest event is on the
+first line, so the thing that just happened is what you land on; read down for
+how it got there.
+
+`esc`, `backspace` or `q` returns to the grid, and it comes back *exactly* as you
+left it: same filters, same sort, same zoom, same pan, same selection. That is
+not restoration — the pane is a separate screen and opening it changes no view
+state at all, so there is nothing to put back and nothing to get subtly wrong.
+
+The pane scrolls (`↑↓ jk`, `pgup`/`pgdn`, `g`/`G`, or the wheel) and re-reads
+itself every few seconds, because on a draining node the events arrive while you
+are reading them; `ctrl+r` re-reads live detail immediately. Events are fetched
+through bounded describe requests rather than watched: on demand in real-time,
+and periodically for each node while playback history is active. A cluster-wide
+event watch would cost more than the rest of the viewer put together. On a
+Karpenter cluster the NodeClaim's events
+are merged in and tagged `(claim)` — the launch and disruption decisions are
+recorded there, not on the Node, so a pane without them shows only kubelet's half
+of the conversation.
+
+Open the pane on a **provisioning** box and it describes the NodeClaim — its
+capacity, labels, provider ID and provisioning conditions (`Launched`,
+`Registered`, `Initialized`, `Ready`) alongside the events — because there is no
+Node object to describe yet. When kubelet registers, the pane **follows the claim
+into the Node it became**: the two objects have different names, so a pane that
+did not follow would announce that the node had gone at the exact moment it
+succeeded. The claim's content stays up until the Node's first read lands, and
+the cursor moves with it, so `esc` returns to the right card.
+
+In `--demo` the simulation records its own history as it runs, so the pane works
+in a rehearsal exactly as it does against a cluster.
 
 ### Zoom
 
@@ -225,11 +347,11 @@ it survives a washed-out projector and does not depend on distinguishing hues:
 | Phase | Border | Badge |
 |---|---|---|
 | ready | thin, green | — |
-| provisioning | dashed, violet, breathing | `◇ new` |
-| cordoned | thin, blue | `⏸ cord` |
-| draining | heavy, amber, pulsing + diagonal hatch on free capacity | `▼ drain` |
-| deleting | heavy, red, fast pulse | `✕ term` |
-| not ready | heavy, orange | `! down` |
+| provisioning | dashed, violet, breathing | `◇ PROVISIONING` |
+| cordoned | thin, blue | `⏸ CORDONED` |
+| draining | heavy, amber, pulsing + diagonal hatch on free capacity | `▼ DRAINING` |
+| terminating | heavy, red, fast pulse | `✕ TERMINATING` |
+| not ready | heavy, orange | `! NOT READY` |
 
 Pod cells encode state in the glyph as well as the colour: `█` running,
 `▒` pending, `▓` terminating, `╳` failed.
@@ -239,18 +361,50 @@ Pod cells encode state in the glyph as well as the colour: `█` running,
 Exactly two visual languages, and the legend labels both:
 
 ```
-node   ││ ready  ┊┊ provisioning  ││ cordoned  ┃┃ draining  ┃┃ deleting     meter ▁▂▃ 0→100%
-pods   ██ running  ▒▒ pending  ▓▓ terminating  ╳╳ failed  · cell size = cpu request
+node   [✓ READY] [◇ PROVISIONING] [⏸ CORDONED] [▼ DRAINING] [✕ TERMINATING] [! NOT READY]
+pods   [● RUNNING] [○ PENDING] [◐ TERMINATING] [× FAILED]  · cell size = cpu request
 ```
 
-- **Border** = node phase. Shown in the legend as border glyphs, never as solid
-  blocks, so a phase swatch cannot be mistaken for a pod cell.
+- **Status chip** = the node's current phase. It keeps the full label wherever
+  the card width permits and at least the phase icon when extremely compact;
+  colour and border treatment reinforce it rather than requiring a legend lookup.
+- **Recent footer** = observed phase changes from the last ten seconds. The
+  current chip never lags the cluster, while a quick cordon or termination stays
+  visible long enough to explain during a live demonstration.
 - **Fill inside the card** = pod state, and nothing else. Running is one calm
   teal, so a node interior reads as a single packed mass whose *area* is how
   full the node is. Pending, terminating and failed are accents that only show
   up when something is happening.
 - **Cell size** = the pod's CPU request as a fraction of allocatable.
 - **Glyph** = the same state as the colour, so it survives a bad projector.
+- **Meter colour** = how well packed the thing is, and it runs *toward green*.
+  See below.
+
+### The utilisation ramp runs toward green
+
+The CPU and memory meters — on every card, in the header, and in the detail pane
+— are coloured by a ramp that goes slate → blue → cyan → **green** as they fill.
+A node at 95% is bright green.
+
+That is the opposite of a monitoring dashboard, on purpose. This tool is about
+bin-packing and what a cluster costs: an empty node is money being burned, and a
+full one is a provisioner doing its job. Colouring 90% red would tell the
+audience the wrong story every time a scale-up finished successfully.
+
+Red and amber are still on screen, and they still mean something is wrong — a
+failed pod, a draining node, an unschedulable backlog in the pending meter. They
+just no longer double as "this node is busy". Luminance climbs monotonically
+along the ramp, so the fill level is legible even where the hue is not.
+
+**Stacked meters are half-height bars.** Where meters sit a row apart — the
+header's three, one per row in the dense table, four in the detail pane — the
+bar is drawn as a `▄` glyph rather than as a filled cell background. Two
+background fills on adjacent rows have no edge between them and merge into a
+single two-row block of two colours, which reads as neither bar. A half-height
+bar has a top edge, and that edge is the separation, at a cost of no rows at
+all. The node cards keep the full-cell fill: their figures have to sit *on* the
+meter, which a glyph bar cannot support, and there the text breaks the colour up
+anyway.
 
 Pod colours were briefly hashed from the workload name. That was a mistake: a
 colour nobody can decode is worse than no colour, and the hashed hues collided
@@ -280,12 +434,17 @@ A **provisioning** box appears the moment Karpenter creates a NodeClaim, before
 the Node object exists. That gap is the most interesting half-second of a
 scale-up and is invisible if you only watch Nodes.
 
-Utilisation defaults to summed pod **requests**, which is what the scheduler
-acts on and needs nothing installed. Press `u` for actual usage from
-metrics-server if it is present.
+Ages count in **seconds up to 99s** before rounding to minutes, rather than
+switching at 60s the way `kubectl` does. An instance takes about ninety seconds
+to reach Ready, and that is the wait the second-by-second resolution is for.
 
-Node cost is shown when a node or NodeClaim carries the annotation
-`node-viewer.oxide.computer/hourly-price`; no cloud pricing table is bundled.
+Utilisation is summed pod **requests**, which is what the scheduler acts on and
+needs nothing installed. Keeping this fixed gives every meter one meaning.
+
+Node cost is shown when a node or NodeClaim carries a numeric hourly-price annotation; no cloud
+pricing table is bundled. The default is Oxide's `karpenter.oxide.computer/hourly-price`. Use
+`--price-annotation example.com/hourly-price` for a provider that publishes the value under another
+annotation key.
 
 ## Architecture
 
@@ -343,6 +502,15 @@ with per-cell contrast picking for text over fills. Runs of identical style are
 coalesced on output. Meter *fills* and meter *tips* are separate calls so the
 sub-cell tip can be drawn after the labels and never lands on top of one.
 
+There are two meter primitives, and which one is right depends on whether text
+has to sit on the bar. `hMeter` fills the cell *background*, so labels and
+percentages can be drawn over it with per-cell contrast — that is what the node
+cards need, because there is no room beside a 28-column card meter for its
+figures. `hMeterRail` draws the bar as a half-height glyph (`▄`) instead, which
+gives it a top edge and costs no rows; nothing may be drawn on top of it, so its
+percentage sits beside it. Everywhere meters stack a row apart — the header's
+three, the dense table's one-per-node, the detail pane's four — uses rails.
+
 **The grid is laid out by aspect ratio, not by width.** `computeLayout` scores
 each column count by how close the resulting card is to a pleasing shape,
 preferring layouts that show every node at once and that leave no ragged last
@@ -358,6 +526,22 @@ modes and mid-animation states.
 **Optional APIs degrade, never fail.** metrics-server and Karpenter are probed
 once at startup; missing either loses a feature and says so in the header.
 
+**Events are read two ways, on purpose.** The detail pane reads a node's events
+through a plain API call and a `ui.Describer` the sources implement — on demand
+while live, and as bounded periodic samples while playback history is active.
+Events are the highest-volume resource in a cluster by a wide margin, and an
+informer for all of them would be the most expensive thing here. Sampling only
+while it serves an open or delayed view keeps that cost proportional to the
+feature using it.
+
+The `CONS` column cannot work that way: it needs a verdict for every node,
+continuously, and polling every node's events to fill a table column would be
+absurd. So it gets a watch — but a `fieldSelector=reason=…` one, a separate
+informer per reason, because field selectors have no set operator and a
+client-side filter over all events is the very thing being avoided. The API server
+sends a handful of objects per node and nothing else. Which read a feature needs is
+decided by whether it wants one node on demand or every node all the time.
+
 ### Extending it
 
 - **A command:** one entry in `registry` (`internal/ui/commands.go`). Help text
@@ -366,8 +550,13 @@ once at startup; missing either loses a feature and says so in the header.
 - **Colours:** `internal/theme`. `Theme` is the whole surface; `theme.Use` swaps.
 - **Card geometry:** the sizing constants at the top of `internal/ui/layout.go`.
 - **Node-state styling:** `borderStyle` in `internal/ui/nodebox.go`.
+- **A section in the detail pane:** one `append…` helper called from
+  `Model.detailLines` (`internal/ui/detail.go`); lines are spans of coloured text,
+  so nothing there can emit a row of the wrong width.
 - **Another provisioner:** the well-known label and taint constants at the top of
   `internal/source/kube/convert.go`, plus `derivePhase`.
+- **Another consolidation verdict reason:** one entry in `consolidationReasons`
+  (`internal/source/kube/consolidation.go`); a watch is started per entry.
 
 ## Testing
 
@@ -388,7 +577,9 @@ KNV_DUMP=/tmp/frames.txt go test ./internal/ui/ -run TestDumpFrames
 
 ## Permissions
 
-Read-only. `get`/`list`/`watch` on nodes and pods; the same on
+Read-only. `get`/`list`/`watch` on nodes and pods; `list`/`watch` on events for
+the detail pane and the `CONS` column (without it the pane still opens and says
+why the events are missing, and the column stays `·`); the same on
 `karpenter.sh` nodepools and nodeclaims if present; and
 `metrics.k8s.io` if you want actual usage. The viewer never writes to a real
 cluster — the interactive scale/drain commands are rejected unless the data is

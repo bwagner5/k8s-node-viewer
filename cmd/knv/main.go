@@ -14,7 +14,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/spf13/pflag"
+	"k8s.io/klog/v2"
 
 	"github.com/oxidecomputer/k8s-node-viewer/internal/model"
 	"github.com/oxidecomputer/k8s-node-viewer/internal/source/fake"
@@ -29,20 +31,20 @@ import (
 const snapshotInterval = 100 * time.Millisecond
 
 type flags struct {
-	kubeconfig  string
-	kubeContext string
-	mode        string
-	basis       string
-	sortKey     string
-	themeName   string
-	nodePool    string
-	namespace   string
-	nodeQuery   string
-	capacity    string
-	fps         int
-	metricsRate time.Duration
-	legend      bool
-	hideDS      bool
+	kubeconfig       string
+	kubeContext      string
+	mode             string
+	sortKey          string
+	themeName        string
+	nodePool         string
+	nodeQuery        string
+	fps              int
+	metricsRate      time.Duration
+	priceAnnotation  string
+	playbackSpeed    float64
+	historyDuration  time.Duration
+	historyMemoryMiB int64
+	legend           bool
 
 	demo      bool
 	demoNodes int
@@ -64,17 +66,17 @@ func run() error {
 	pflag.StringVar(&f.kubeconfig, "kubeconfig", "", "path to kubeconfig (default: standard loading rules)")
 	pflag.StringVar(&f.kubeContext, "context", "", "kubeconfig context to use")
 	pflag.StringVar(&f.mode, "mode", "pods", "initial view: pods, nodes, or dense")
-	pflag.StringVar(&f.basis, "util", "requests", "drive meters from 'requests' or 'usage' (metrics-server)")
 	pflag.StringVar(&f.sortKey, "sort", "name", "initial sort: name, cpu, mem, pods, age, nodepool, type")
 	pflag.StringVar(&f.themeName, "theme", "dark", "palette: dark or light")
 	pflag.StringVar(&f.nodePool, "nodepool", "", "start filtered to a Karpenter NodePool")
-	pflag.StringVar(&f.namespace, "namespace", "", "start with a namespace highlighted")
 	pflag.StringVar(&f.nodeQuery, "node", "", "start filtered to nodes matching a regex")
-	pflag.StringVar(&f.capacity, "capacity", "", "start filtered to 'spot' or 'on-demand'")
 	pflag.IntVar(&f.fps, "fps", 20, "animation frame rate")
 	pflag.DurationVar(&f.metricsRate, "metrics-interval", 5*time.Second, "how often to poll metrics.k8s.io")
+	pflag.StringVar(&f.priceAnnotation, "price-annotation", kube.DefaultPriceAnnotation, "annotation containing a node or NodeClaim's numeric hourly price")
+	pflag.Float64Var(&f.playbackSpeed, "playback-speed", 1, "initial cluster playback speed from 0 (paused) to 1 (realtime)")
+	pflag.DurationVar(&f.historyDuration, "history-duration", 10*time.Minute, "maximum buffered playback history")
+	pflag.Int64Var(&f.historyMemoryMiB, "history-memory", 256, "approximate playback history memory limit in MiB")
 	pflag.BoolVar(&f.legend, "legend", true, "show the colour legend")
-	pflag.BoolVar(&f.hideDS, "hide-daemonsets", false, "omit DaemonSet pods from the cells")
 
 	pflag.BoolVar(&f.demo, "demo", false, "run against a simulated cluster instead of a real one")
 	pflag.IntVar(&f.demoNodes, "demo-nodes", 12, "initial node count in demo mode")
@@ -95,6 +97,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	silenceClientGoLogging()
 	if !theme.Use(f.themeName) {
 		return fmt.Errorf("unknown theme %q (want dark or light)", f.themeName)
 	}
@@ -104,13 +107,14 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	store, runSource, demo, hasMetrics, err := startSource(ctx, &f)
+	src, err := startSource(ctx, &f)
 	if err != nil {
 		return err
 	}
-	cfg.Snapshots = store.Watch(ctx, snapshotInterval)
-	cfg.Demo = demo
-	cfg.HasMetrics = hasMetrics
+	cfg.Snapshots = src.store.Watch(ctx, snapshotInterval)
+	cfg.Demo = src.demo
+	cfg.Describe = src.describe
+	runSource := src.run
 
 	// The source runs alongside the UI; a source failure should tear the UI down
 	// rather than leave a frozen screen, so it cancels the shared context.
@@ -136,8 +140,31 @@ func run() error {
 	return nil
 }
 
+// silenceClientGoLogging stops client-go writing over the screen.
+//
+// Informers log through klog, which writes to stderr — and stderr, in a
+// full-screen alt-screen program, is the screen. A reflector that cannot list a
+// resource retries forever, so one missing permission turns into a stream of
+// "events is forbidden" scribbled across the frame at seconds' interval. The
+// informers already degrade quietly when a resource is unreadable; this is what
+// makes them do it *silently*, which is the behaviour the rest of the program
+// assumes. It matters most for events, the permission most often left out of a
+// read-only role, and it is why a forbidden CONS column costs you a dim dot
+// rather than a ruined display.
+func silenceClientGoLogging() { klog.SetLogger(logr.Discard()) }
+
 func buildConfig(f *flags) (ui.Config, error) {
-	cfg := ui.Config{FPS: f.fps, Legend: f.legend}
+	if f.playbackSpeed < 0 || f.playbackSpeed > 1 {
+		return ui.Config{}, fmt.Errorf("--playback-speed must be between 0 and 1")
+	}
+	if f.historyDuration <= 0 {
+		return ui.Config{}, fmt.Errorf("--history-duration must be positive")
+	}
+	if f.historyMemoryMiB <= 0 {
+		return ui.Config{}, fmt.Errorf("--history-memory must be positive")
+	}
+	cfg := ui.Config{FPS: f.fps, Legend: f.legend, PlaybackSpeed: f.playbackSpeed,
+		PlaybackSet: true, HistoryDuration: f.historyDuration, HistoryMemory: f.historyMemoryMiB << 20}
 
 	mode, ok := ui.ParseMode(f.mode)
 	if !ok {
@@ -151,30 +178,28 @@ func buildConfig(f *flags) (ui.Config, error) {
 	}
 	cfg.Sort = sortKey
 
-	switch f.basis {
-	case "requests", "req":
-		cfg.Basis = model.BasisRequests
-	case "usage", "actual":
-		cfg.Basis = model.BasisUsage
-	default:
-		return cfg, fmt.Errorf("unknown --util %q (want requests or usage)", f.basis)
-	}
-
-	cfg.Filter = ui.Filter{
-		NodePool:       f.nodePool,
-		Namespace:      f.namespace,
-		CapacityType:   f.capacity,
-		HideDaemonSets: f.hideDS,
-	}
+	cfg.Filter = ui.Filter{NodePool: f.nodePool}
 	if err := cfg.Filter.SetNodeQuery(f.nodeQuery); err != nil {
 		return cfg, fmt.Errorf("bad --node pattern: %w", err)
 	}
 	return cfg, nil
 }
 
-// startSource builds either the live or simulated source. Both return a store
-// and a blocking run function, so the caller does not care which it got.
-func startSource(ctx context.Context, f *flags) (*model.Store, func(context.Context) error, ui.Demo, bool, error) {
+// source is a started source, live or simulated, in the terms the UI needs it.
+// Bundling them keeps the wiring one assignment per capability instead of a
+// five-value return that has to be read against its signature.
+type source struct {
+	store *model.Store
+	run   func(context.Context) error
+	// demo is nil against a real cluster: the viewer never mutates one.
+	demo ui.Demo
+	// describe backs the node detail pane. Both sources provide it — reading a
+	// node and its events is a read, and safe against production.
+	describe ui.Describer
+}
+
+// startSource builds either the live or simulated source.
+func startSource(ctx context.Context, f *flags) (*source, error) {
 	if f.demo {
 		cluster, store := fake.New(fake.Options{
 			Nodes:     f.demoNodes,
@@ -183,19 +208,17 @@ func startSource(ctx context.Context, f *flags) (*model.Store, func(context.Cont
 			Autopilot: f.demoAuto,
 			DrainFor:  f.demoDrain,
 		})
-		return store, cluster.Run, cluster, true, nil
+		return &source{store: store, run: cluster.Run, demo: cluster, describe: cluster}, nil
 	}
 
 	src, store, err := kube.New(kube.Options{
-		Kubeconfig:  f.kubeconfig,
-		Context:     f.kubeContext,
-		MetricsRate: f.metricsRate,
+		Kubeconfig:      f.kubeconfig,
+		Context:         f.kubeContext,
+		MetricsRate:     f.metricsRate,
+		PriceAnnotation: f.priceAnnotation,
 	})
 	if err != nil {
-		return nil, nil, nil, false, fmt.Errorf("%w\n\nno cluster? try --demo for a simulated one", err)
+		return nil, fmt.Errorf("%w\n\nno cluster? try --demo for a simulated one", err)
 	}
-	if !src.HasMetrics() && f.basis == "usage" {
-		return nil, nil, nil, false, errors.New("--util usage requires metrics.k8s.io, which this cluster does not serve")
-	}
-	return store, src.Run, nil, src.HasMetrics(), nil
+	return &source{store: store, run: src.Run, describe: src}, nil
 }

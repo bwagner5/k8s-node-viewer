@@ -56,6 +56,17 @@ func TestDumpFrames(t *testing.T) {
 	out = append(out, "\n===== help =====\n"...)
 	out = append(out, m2.View()...)
 
+	// The detail pane, at two widths: the wide one has a component column and the
+	// narrow one does not, which is the layout decision worth eyeballing.
+	for _, size := range []struct{ w, h int }{{160, 44}, {96, 30}} {
+		m3 := agedTestModel(t, size.w, size.h, 14)
+		m3.describe = &stubDescriber{detail: sampleDetail("")}
+		m3.setCursor(2)
+		openPane(t, m3)
+		out = append(out, ("\n===== node detail " + itoa(size.w) + "x" + itoa(size.h) + " =====\n")...)
+		out = append(out, m3.View()...)
+	}
+
 	if err := os.WriteFile(path, out, 0o644); err != nil {
 		t.Fatal(err)
 	}

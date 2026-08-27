@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
+	"github.com/mattn/go-runewidth"
 	"github.com/muesli/termenv"
 
 	"github.com/oxidecomputer/k8s-node-viewer/internal/model"
@@ -27,12 +29,10 @@ func testSnapshot(nodes int) *model.Snapshot {
 		Taken:        time.Now(),
 		Context:      "test",
 		HasKarpenter: true,
-		HasMetrics:   true,
 		NodePools:    []*model.NodePool{{Name: "general"}, {Name: "spot-batch"}},
-		Namespaces:   []string{"ml", "shop"},
 	}
 	phases := []model.Phase{model.PhaseReady, model.PhaseProvisioning, model.PhaseDraining,
-		model.PhaseDeleting, model.PhaseCordoned, model.PhaseNotReady, model.PhaseGone}
+		model.PhaseTerminating, model.PhaseCordoned, model.PhaseNotReady, model.PhaseGone}
 	for i := 0; i < nodes; i++ {
 		n := &model.Node{
 			Name:         "ip-10-0-0-" + itoa(i),
@@ -72,12 +72,17 @@ func testSnapshot(nodes int) *model.Snapshot {
 		snap.Totals.HourlyCost += n.Price
 		snap.Nodes = append(snap.Nodes, n)
 	}
+	// A backlog scaled to the fleet, so every geometry case also exercises the
+	// pending meter — including the zero-node case, which must render the empty
+	// bar rather than a division by nothing.
+	snap.Totals.Pending = nodes * 2
+	snap.Totals.Unschedulable = nodes / 2
 	return snap
 }
 
 func newTestModel(t *testing.T, w, h, nodes int) *Model {
 	t.Helper()
-	m := New(Config{FPS: 20, Legend: true, HasMetrics: true})
+	m := New(Config{FPS: 20, Legend: true})
 	m.w, m.h = w, h
 	m.applySnapshot(testSnapshot(nodes))
 	return m
@@ -109,6 +114,54 @@ func TestFrameGeometry(t *testing.T) {
 				assertFrame(t, mid, size.w, size.h, mode, count, "animating")
 			}
 		}
+	}
+}
+
+func TestPhaseChangeTriggersOneShotHighlight(t *testing.T) {
+	m := newTestModel(t, 120, 36, 1)
+	for i := 0; i < 40; i++ {
+		m.reg.Advance(25 * time.Millisecond)
+	}
+	next := testSnapshot(1)
+	next.Nodes[0].Phase = model.PhaseDraining
+	m.applySnapshot(next)
+	if got := m.reg.Node(next.Nodes[0].Name).Flash; got != 1 {
+		t.Fatalf("phase transition flash = %v, want 1", got)
+	}
+}
+
+func TestRewindSeekOverlayIsCenteredAndAccumulates(t *testing.T) {
+	m := newTestModel(t, 100, 30, 3)
+	m.showSeekOverlay(5 * time.Second)
+	m.showSeekOverlay(5 * time.Second)
+	frame := m.View()
+	label := "− 10 seconds"
+	if !strings.Contains(frame, label) {
+		t.Fatalf("rewind frame is missing %q", label)
+	}
+	assertFrame(t, m, m.w, m.h, m.mode, len(m.vis), "rewind overlay")
+
+	wantX := (m.w - runewidth.StringWidth(label)) / 2
+	wantY := m.h / 2
+	foundY := -1
+	for y, line := range strings.Split(frame, "\n") {
+		plain := ansi.Strip(line)
+		if byteX := strings.Index(plain, "−"); byteX >= 0 {
+			foundY = y
+			x := runewidth.StringWidth(plain[:byteX])
+			if x != wantX {
+				t.Errorf("overlay starts at column %d, want %d", x, wantX)
+			}
+			break
+		}
+	}
+	if foundY < wantY-1 || foundY > wantY {
+		t.Errorf("overlay text is on row %d, want the centre near %d", foundY, wantY)
+	}
+
+	m.seekOverlayAt = time.Now().Add(-seekOverlayTTL)
+	if expired := m.View(); strings.Contains(expired, label) {
+		t.Fatal("expired rewind overlay is still visible")
 	}
 }
 

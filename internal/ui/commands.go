@@ -5,8 +5,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
-	"github.com/oxidecomputer/k8s-node-viewer/internal/model"
 	"github.com/oxidecomputer/k8s-node-viewer/internal/theme"
 )
 
@@ -19,19 +19,15 @@ type argKind int
 const (
 	argNone argKind = iota
 	argNodePool
-	argNamespace
-	argOwner
 	argMode
 	argSort
-	argBasis
 	argTheme
-	argPhase
-	argInstanceType
-	argCapacity
 	argOnOff
 	argFree
 	argCount
 	argZoom
+	argSpeed
+	argRewind
 )
 
 // command is one entry in the palette.
@@ -67,30 +63,6 @@ var registry = []command{
 		},
 	},
 	{
-		name: "namespace", aliases: []string{"ns"}, arg: argNamespace, argHint: "<name|all>",
-		help: "highlight pods in a namespace (grey out the rest)",
-		run: func(m *Model, arg string) (string, error) {
-			if isAll(arg) {
-				m.filter.Namespace = ""
-				return "namespace filter cleared", nil
-			}
-			m.filter.Namespace = arg
-			return "namespace: " + arg, nil
-		},
-	},
-	{
-		name: "owner", aliases: []string{"app", "workload"}, arg: argOwner, argHint: "<substring|all>",
-		help: "highlight pods whose controller name matches",
-		run: func(m *Model, arg string) (string, error) {
-			if isAll(arg) {
-				m.filter.Owner = ""
-				return "owner filter cleared", nil
-			}
-			m.filter.Owner = arg
-			return "owner: " + arg, nil
-		},
-	},
-	{
 		name: "node", aliases: []string{"n"}, arg: argFree, argHint: "<regex|all>",
 		help: "show only nodes whose name matches a regex",
 		run: func(m *Model, arg string) (string, error) {
@@ -101,59 +73,6 @@ var registry = []command{
 				return "", fmt.Errorf("bad pattern: %w", err)
 			}
 			return "node: " + arg, nil
-		},
-	},
-	{
-		name: "type", aliases: []string{"instance"}, arg: argInstanceType, argHint: "<instance-type|all>",
-		help: "show only nodes of an instance type",
-		run: func(m *Model, arg string) (string, error) {
-			if isAll(arg) {
-				m.filter.InstanceType = ""
-				return "instance-type filter cleared", nil
-			}
-			m.filter.InstanceType = arg
-			return "type: " + arg, nil
-		},
-	},
-	{
-		name: "capacity", aliases: []string{"cap"}, arg: argCapacity, argHint: "<spot|on-demand|all>",
-		help: "show only spot or on-demand capacity",
-		run: func(m *Model, arg string) (string, error) {
-			if isAll(arg) {
-				m.filter.CapacityType = ""
-				return "capacity filter cleared", nil
-			}
-			m.filter.CapacityType = arg
-			return "capacity: " + arg, nil
-		},
-	},
-	{
-		name: "phase", aliases: []string{"state"}, arg: argPhase, argHint: "<ready|draining|…|all>",
-		help: "show only nodes in given phases (repeat to add)",
-		run: func(m *Model, arg string) (string, error) {
-			if isAll(arg) {
-				m.filter.Phases = nil
-				return "phase filter cleared", nil
-			}
-			p, ok := parsePhase(arg)
-			if !ok {
-				return "", fmt.Errorf("unknown phase %q", arg)
-			}
-			if m.filter.Phases == nil {
-				m.filter.Phases = map[model.Phase]bool{}
-			}
-			// Toggling means ":phase draining" twice returns you to everything,
-			// which is faster than remembering ":phase all".
-			if m.filter.Phases[p] {
-				delete(m.filter.Phases, p)
-			} else {
-				m.filter.Phases[p] = true
-			}
-			if len(m.filter.Phases) == 0 {
-				m.filter.Phases = nil
-				return "phase filter cleared", nil
-			}
-			return "phase: " + strings.Join(m.filter.Describe(), " "), nil
 		},
 	},
 	{
@@ -169,46 +88,6 @@ var registry = []command{
 		},
 	},
 	{
-		name: "pods", arg: argOnOff, argHint: "<on|off>",
-		help: "shorthand for mode pods / mode nodes",
-		run: func(m *Model, arg string) (string, error) {
-			on, ok := parseOnOff(arg)
-			if !ok {
-				return "", fmt.Errorf("expected on or off")
-			}
-			if on {
-				m.setMode(ModePods)
-				return "pods: on", nil
-			}
-			m.setMode(ModeNodes)
-			return "pods: off (utilisation only)", nil
-		},
-	},
-	{
-		name: "daemonsets", aliases: []string{"ds"}, arg: argOnOff, argHint: "<on|off>",
-		help: "include DaemonSet pods in the cells",
-		run: func(m *Model, arg string) (string, error) {
-			on, ok := parseOnOff(arg)
-			if !ok {
-				return "", fmt.Errorf("expected on or off")
-			}
-			m.filter.HideDaemonSets = !on
-			return fmt.Sprintf("daemonsets: %s", onOff(on)), nil
-		},
-	},
-	{
-		name: "only", arg: argOnOff, argHint: "<on|off>",
-		help: "hide nodes with no pod matching the namespace/owner filter",
-		run: func(m *Model, arg string) (string, error) {
-			on, ok := parseOnOff(arg)
-			if !ok {
-				return "", fmt.Errorf("expected on or off")
-			}
-			m.filter.Only = on
-			return "only: " + onOff(on), nil
-		},
-	},
-	{
 		name: "sort", aliases: []string{"s"}, arg: argSort, argHint: "<key>",
 		help: "order the grid by name, cpu, mem, pods, age, nodepool or type",
 		run: func(m *Model, arg string) (string, error) {
@@ -221,21 +100,64 @@ var registry = []command{
 		},
 	},
 	{
-		name: "util", aliases: []string{"basis"}, arg: argBasis, argHint: "<requests|usage>",
-		help: "drive the meters from pod requests or metrics-server usage",
+		name: "speed", aliases: []string{"rate"}, arg: argSpeed, argHint: "<0x…1x|realtime>",
+		help: "slow, pause, or return the cluster timeline to realtime",
 		run: func(m *Model, arg string) (string, error) {
-			switch arg {
-			case "requests", "req":
-				m.basis = model.BasisRequests
-			case "usage", "actual":
-				if !m.hasMetrics {
-					return "", fmt.Errorf("metrics.k8s.io not available in this cluster")
-				}
-				m.basis = model.BasisUsage
-			default:
-				return "", fmt.Errorf("expected requests or usage")
+			if isRealtime(arg) {
+				m.pendingCmd = m.goRealtime("")
+				return "realtime", nil
 			}
-			return "meters: " + m.basis.String(), nil
+			speed, err := parsePlaybackSpeed(arg)
+			if err != nil {
+				return "", err
+			}
+			if err := m.setPlaybackSpeed(speed); err != nil {
+				return "", err
+			}
+			if speed == 0 {
+				return playbackStatus(m.playback, time.Now()), nil
+			}
+			return playbackStatus(m.playback, time.Now()), nil
+		},
+	},
+	{
+		name: "pause", arg: argNone,
+		help: "pause the cluster timeline (p toggles pause)",
+		run: func(m *Model, _ string) (string, error) {
+			if m.playback.live || m.playback.speed != 0 {
+				m.togglePause()
+			}
+			return "", nil
+		},
+	},
+	{
+		name: "resume", arg: argNone,
+		help: "resume the paused timeline at its previous speed",
+		run: func(m *Model, _ string) (string, error) {
+			if !m.playback.live && m.playback.speed == 0 {
+				m.togglePause()
+			}
+			if m.playback.live {
+				return "realtime", nil
+			}
+			return "", nil
+		},
+	},
+	{
+		name: "rewind", aliases: []string{"back"}, arg: argRewind, argHint: "<duration>",
+		help: "rewind buffered playback by a duration such as 5s or 20s",
+		run: func(m *Model, arg string) (string, error) {
+			amount, err := parseRewindDuration(arg)
+			if err != nil {
+				return "", err
+			}
+			cmd, moved := m.rewindPlayback(amount)
+			m.pendingCmd = cmd
+			if moved == 0 {
+				return "no rewind history yet", nil
+			}
+			return fmt.Sprintf("rewound %s · %s", moved.Round(time.Millisecond),
+				playbackStatus(m.playback, time.Now())), nil
 		},
 	},
 	{
@@ -299,22 +221,6 @@ var registry = []command{
 		},
 	},
 	{
-		name: "clear", aliases: []string{"reset"}, arg: argNone,
-		help: "clear every filter",
-		run: func(m *Model, _ string) (string, error) {
-			m.filter.Clear()
-			return "filters cleared", nil
-		},
-	},
-	{
-		name: "help", aliases: []string{"h", "?"}, arg: argNone,
-		help: "show the help overlay",
-		run: func(m *Model, _ string) (string, error) {
-			m.showHelp = true
-			return "", nil
-		},
-	},
-	{
 		name: "quit", aliases: []string{"q", "exit"}, arg: argNone,
 		help: "exit",
 		run: func(m *Model, _ string) (string, error) {
@@ -336,7 +242,7 @@ var registry = []command{
 	},
 	{
 		name: "drain", arg: argNone, demoOnly: true,
-		help: "simulate draining and deleting a node",
+		help: "simulate draining and terminating a node",
 		run: func(m *Model, _ string) (string, error) {
 			m.demo.DrainOne()
 			return "draining a node", nil
@@ -348,6 +254,34 @@ var registry = []command{
 		run: func(m *Model, _ string) (string, error) {
 			m.demo.Churn()
 			return "churning pods", nil
+		},
+	},
+	{
+		name: "burst", arg: argCount, argHint: "<n>", demoOnly: true,
+		help: "submit n unscheduled pods",
+		run: func(m *Model, arg string) (string, error) {
+			n, err := strconv.Atoi(arg)
+			if err != nil || n < 1 || n > 500 {
+				return "", fmt.Errorf("expected a count between 1 and 500")
+			}
+			m.demo.Burst(n)
+			return fmt.Sprintf("submitting %d pods", n), nil
+		},
+	},
+	{
+		name: "clear", aliases: []string{"reset"}, arg: argNone,
+		help: "clear every filter",
+		run: func(m *Model, _ string) (string, error) {
+			m.filter.Clear()
+			return "filters cleared", nil
+		},
+	},
+	{
+		name: "help", aliases: []string{"h", "?"}, arg: argNone,
+		help: "show the help overlay",
+		run: func(m *Model, _ string) (string, error) {
+			m.showHelp = true
+			return "", nil
 		},
 	},
 }
@@ -367,7 +301,7 @@ func lookup(name string) (*command, bool) {
 	return nil, false
 }
 
-// commandNames lists every invocable name (canonical only) for completion.
+// commandNames lists the visible canonical names for completion.
 func commandNames(includeDemo bool) []string {
 	out := make([]string, 0, len(registry))
 	for i := range registry {
@@ -377,7 +311,22 @@ func commandNames(includeDemo bool) []string {
 		out = append(out, registry[i].name)
 	}
 	sort.Strings(out)
+	// Actions that affect the whole palette belong at its end, in the order a
+	// user needs them: clear first, help as the final escape hatch.
+	out = moveCommandToEnd(out, "clear")
+	out = moveCommandToEnd(out, "help")
 	return out
+}
+
+func moveCommandToEnd(names []string, want string) []string {
+	for i, name := range names {
+		if name == want {
+			copy(names[i:], names[i+1:])
+			names[len(names)-1] = want
+			break
+		}
+	}
+	return names
 }
 
 // Run parses and executes a command line. It returns the status message to show.
@@ -416,50 +365,52 @@ func (m *Model) candidates(cmd *command) []string {
 			out = append(out, np)
 		}
 		return out
-	case argNamespace:
-		return append([]string{"all"}, m.snapshotNamespaces()...)
-	case argOwner:
-		return append([]string{"all"}, m.snapshotOwners()...)
-	case argInstanceType:
-		return append([]string{"all"}, m.snapshotInstanceTypes()...)
-	case argCapacity:
-		return []string{"all", "spot", "on-demand"}
 	case argMode:
 		return modeNames[:]
 	case argSort:
 		return sortNames[:]
-	case argBasis:
-		return []string{"requests", "usage"}
 	case argTheme:
 		return theme.Names()
-	case argPhase:
-		out := []string{"all"}
-		for _, p := range []model.Phase{model.PhaseReady, model.PhaseProvisioning, model.PhaseNotReady,
-			model.PhaseCordoned, model.PhaseDraining, model.PhaseDeleting} {
-			out = append(out, strings.ToLower(p.String()))
-		}
-		return out
 	case argOnOff:
 		return []string{"on", "off"}
 	case argZoom:
 		return []string{"in", "out", "fit", "max"}
+	case argSpeed:
+		return []string{"realtime", "1x", "0.75x", "0.5x", "0.25x", "0x"}
+	case argRewind:
+		return []string{"5s", "10s", "20s", "30s"}
 	default:
 		return nil
 	}
 }
 
-func parsePhase(s string) (model.Phase, bool) {
-	s = strings.ToLower(s)
-	for i, name := range phaseCommandNames {
-		if name == s {
-			return model.Phase(i), true
-		}
+func isRealtime(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "realtime", "real-time", "live", "rt":
+		return true
+	default:
+		return false
 	}
-	return 0, false
 }
 
-// phaseCommandNames must stay index-aligned with model.Phase.
-var phaseCommandNames = []string{"provisioning", "notready", "ready", "cordoned", "draining", "deleting", "gone"}
+func parsePlaybackSpeed(s string) (float64, error) {
+	raw := strings.TrimSpace(strings.ToLower(s))
+	raw = strings.TrimSuffix(raw, "x")
+	speed, err := strconv.ParseFloat(raw, 64)
+	if err != nil || speed < 0 || speed > 1 {
+		return 0, fmt.Errorf("expected a speed between 0x and 1x, or realtime")
+	}
+	return speed, nil
+}
+
+func parseRewindDuration(s string) (time.Duration, error) {
+	raw := strings.TrimSpace(strings.ToLower(s))
+	amount, err := time.ParseDuration(raw)
+	if err != nil || amount <= 0 {
+		return 0, fmt.Errorf("expected a positive duration such as 5s or 30s")
+	}
+	return amount, nil
+}
 
 func isAll(s string) bool {
 	switch strings.ToLower(s) {

@@ -5,12 +5,16 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/x/ansi"
+	"github.com/mattn/go-runewidth"
+
 	"github.com/oxidecomputer/k8s-node-viewer/internal/model"
 	"github.com/oxidecomputer/k8s-node-viewer/internal/theme"
 )
 
 // headerHeight is fixed so the grid geometry does not change as totals grow.
-const headerHeight = 3
+// Four rows: title, cpu, mem, pending.
+const headerHeight = 4
 
 // renderHeader draws the title row, the cluster-wide meters, and the counts.
 //
@@ -35,24 +39,20 @@ func (m *Model) renderHeader(w int) string {
 
 	// Capability chips: say plainly when a feature is unavailable rather than
 	// silently showing zeros.
-	chips := []string{"meters: " + m.basis.String()}
-	if !snap.HasMetrics {
-		chips = append(chips, "no metrics-server")
-	}
+	var chips []string
 	if !snap.HasKarpenter {
 		chips = append(chips, "no karpenter")
 	}
 	if m.demo != nil {
 		chips = append(chips, "DEMO")
 	}
-	c.textRight(0, 0, w-1, strings.Join(chips, " · ")+" ", t.Dim, false)
+	if len(chips) > 0 {
+		c.textRight(0, 0, w-1, strings.Join(chips, " · ")+" ", t.Dim, false)
+	}
 
 	// Row 1-2: fleet totals with meters.
 	totals := snap.Totals
 	used := totals.Requests
-	if m.basis == model.BasisUsage {
-		used = totals.Usage
-	}
 	cpuFrac, memFrac := used.Frac(totals.Allocatable)
 	m.fleet.Target(cpuFrac, memFrac, false)
 
@@ -65,7 +65,7 @@ func (m *Model) renderHeader(w int) string {
 	stateColor := t.Ok
 	var parts []string
 	for _, p := range []model.Phase{model.PhaseProvisioning, model.PhaseDraining,
-		model.PhaseDeleting, model.PhaseNotReady, model.PhaseCordoned} {
+		model.PhaseTerminating, model.PhaseNotReady, model.PhaseCordoned} {
 		if counts[p] > 0 {
 			parts = append(parts, fmt.Sprintf("%d %s", counts[p], phaseAbbrev(p)))
 		}
@@ -87,44 +87,117 @@ func (m *Model) renderHeader(w int) string {
 
 	labelW := max(len(nodeLine), len(costLine)) + 6 // left block + "cpu"/"mem"
 	statsW := 22                                    // "65 / 224" style absolute figures
-	meterW := max(8, w-labelW-statsW-rightW-4)
+	meterW := max(8, w-labelW-statsW-rightW-pctW-4)
 
 	drawHeaderMeter(c, labelW, 1, meterW, "cpu", m.fleet.CPU,
 		fmt.Sprintf("%s / %s", model.HumanCPU(used.CPUMilli), model.HumanCPU(totals.Allocatable.CPUMilli)))
 	drawHeaderMeter(c, labelW, 2, meterW, "mem", m.fleet.Mem,
 		fmt.Sprintf("%s / %s", model.HumanMem(used.MemBytes), model.HumanMem(totals.Allocatable.MemBytes)))
+	// The backlog row has the right-hand block to itself — the pod and state
+	// tallies sit on the rows above — so its figures may spill into that space
+	// and spell "unschedulable" out in full.
+	m.drawPendingMeter(c, labelW, 3, meterW, statsW+rightW)
 
 	c.textRight(0, 1, w-1, podLine, t.Fg, true)
 	c.textRight(0, 2, w-1, stateLine, stateColor, true)
 	return c.String()
 }
 
-// phaseAbbrev keeps the header tallies short enough to survive a narrow
-// terminal; the legend carries the full names.
-func phaseAbbrev(p model.Phase) string {
-	switch p {
-	case model.PhaseProvisioning:
-		return "new"
-	case model.PhaseDraining:
-		return "drain"
-	case model.PhaseDeleting:
-		return "term"
-	case model.PhaseNotReady:
-		return "down"
-	case model.PhaseCordoned:
-		return "cord"
-	default:
-		return strings.ToLower(p.String())
+// drawPendingMeter is the third header row: the scheduling backlog, in the same
+// visual language as the meters above it.
+//
+// Two things are true at once and both have to be readable from the back of a
+// room: how much work is waiting, and how much of it the scheduler has given up
+// on. So it is one bar with two segments — refused pods first, in the error
+// colour, then merely-waiting pods in the warning colour — measured against
+// every pod in the cluster, placed or not. The denominator is what makes it a
+// meter rather than a counter: "40 pending" means nothing without knowing
+// whether the cluster runs 50 pods or 5000.
+func (m *Model) drawPendingMeter(c *canvas, x, y, w, statsW int) {
+	t := theme.Current
+	totals := m.snap.Totals
+	pending, unsched := totals.Pending, totals.Unschedulable
+
+	all := float64(totals.Pods + pending)
+	var pendFrac, unschedFrac float64
+	if all > 0 {
+		pendFrac, unschedFrac = float64(pending)/all, float64(unsched)/all
 	}
+	// A handful of pending pods on a large cluster is a genuinely small
+	// fraction, but "too small to draw" and "none" must not look the same, so
+	// anything non-zero claims at least one cell.
+	if w > 0 {
+		if pending > 0 {
+			pendFrac = max(pendFrac, 1/float64(w))
+		}
+		if unsched > 0 {
+			unschedFrac = max(unschedFrac, 1/float64(w))
+		}
+	}
+	m.pend.Target(pendFrac, unschedFrac, false)
+
+	label, labelColor := "pend", t.Dim
+	switch {
+	case unsched > 0:
+		labelColor = t.Err
+	case pending > 0:
+		labelColor = t.Warn
+	}
+	c.text(x-5, y, label, labelColor, unsched > 0)
+
+	c.hMeterRail(x, y, w, m.pend.CPU, t.Warn, t.Empty)
+	// The refused segment recolours the leading cells of the same rail: it is a
+	// subset of the backlog, not a separate quantity, and stacking it that way
+	// keeps the bar's length equal to the whole backlog.
+	c.recolorRail(x, y, int(clamp01(m.pend.Mem)*float64(w)+0.5), t.Err)
+
+	if pending == 0 {
+		c.text(x+w+pctW, y, "no pods waiting", t.Dim, false)
+		return
+	}
+	// A cell is lit, so "0%" would read as a contradiction; say "<1%" instead.
+	pct := fmt.Sprintf("%.0f%%", m.pend.CPU*100)
+	if m.pend.CPU*100 < 0.5 {
+		pct = "<1%"
+	}
+	col := t.Fg
+	if unsched > 0 {
+		col = t.Err
+	}
+	c.textRight(x+w, y, pctW-1, pct, col, true)
+
+	stats := fmt.Sprintf("%d pending", pending)
+	if unsched > 0 {
+		stats = fmt.Sprintf("%d pending · %d unschedulable", pending, unsched)
+		if len(stats) > statsW {
+			stats = fmt.Sprintf("%d pend · %d unsched", pending, unsched)
+		}
+	}
+	statsCol := t.Dim
+	if unsched > 0 {
+		statsCol = t.Err
+	}
+	c.text(x+w+pctW, y, stats, statsCol, false)
 }
+
+// phaseAbbrev is the canonical header label. The meter yields space to this
+// text because a lifecycle count is more useful than a slightly longer rail.
+func phaseAbbrev(p model.Phase) string {
+	return phaseLabel(p)
+}
+
+// pctW is the width reserved for a meter's percentage, which sits *beside* the
+// bar rather than on it. The header's three meters are stacked one row apart, so
+// they are drawn as half-height rails to keep them from merging into one block —
+// and nothing can be printed on a rail without punching a hole in it.
+const pctW = 6
 
 func drawHeaderMeter(c *canvas, x, y, w int, label string, frac float64, stats string) {
 	t := theme.Current
 	c.text(x-4, y, label, t.Dim, false)
-	c.hMeter(x, y, w, frac, t.Util(frac), t.Empty)
-	c.textContrastRight(x, y, w-1, fmt.Sprintf("%.0f%%", frac*100), true)
-	c.hMeterTip(x, y, w, frac, t.Util(frac), t.Empty)
-	c.text(x+w+1, y, stats, t.Dim, false)
+	c.hMeterRail(x, y, w, frac, t.Util(frac), t.Empty)
+	c.textRight(x+w, y, pctW-1, fmt.Sprintf("%.0f%%", frac*100), t.Fg, true)
+	c.text(x+w+pctW, y, stats, t.Dim, false)
 }
 
 // renderStatus is the bottom line: filters, sort, selection detail, and any
@@ -168,11 +241,13 @@ func (m *Model) renderStatus(w int) string {
 	if m.zoom != 0 && m.mode != ModeDense {
 		left = append(left, "zoom:"+zoomLabel(m.lay.scale))
 	}
+	left = append(left, playbackStatus(m.playback, time.Now()))
 	left = append(left, m.filter.Describe()...)
 	if !m.filter.Active() {
 		left = append(left, "no filters")
 	}
-	c.text(1, 0, strings.Join(left, "  "), t.PanelFg, false)
+	leftText := strings.Join(left, "  ")
+	c.text(1, 0, leftText, t.PanelFg, false)
 
 	// Selected-node detail, right-aligned: enough to identify what you are
 	// pointing at without opening anything.
@@ -185,24 +260,113 @@ func (m *Model) renderStatus(w int) string {
 		if n.CapacityType != "" {
 			detail += " · " + n.CapacityType
 		}
-		if n.Message != "" {
-			detail += " · " + n.Message
+		detail += " · [" + phaseChipLabel(n.Phase) + "]"
+		if reason := phaseDescription(n); reason != "" {
+			detail += " " + reason
 		}
 		if n.HasPrice {
 			detail += fmt.Sprintf(" · $%.3f/hr", n.Price)
 		}
 		col := t.PhaseColor(int(n.Phase))
-		c.textRight(0, 0, w-1, shorten(detail, w/2)+" ", col, true)
+		// Playback time is operational state, so selected-node decoration yields
+		// space to it instead of painting over the timestamp and lag.
+		detailW := min(w/2, max(0, w-runewidth.StringWidth(leftText)-4))
+		if detailW > 1 {
+			c.textRight(0, 0, w-1, shorten(detail, detailW-1)+" ", col, true)
+		}
 	} else {
 		c.textRight(0, 0, w-1, "press : for commands · ? for help ", t.Dim, false)
 	}
 	return c.String()
 }
 
+// playbackStatus keeps rate, cluster timestamp, and lag in one readout. The
+// same wallNow drives both timestamp and lag so the two figures cannot disagree
+// at a second boundary.
+func playbackStatus(p *playback, wallNow time.Time) string {
+	displayAt := p.DisplayNow(wallNow).Local()
+	stampLayout := "15:04:05"
+	wallLocal := wallNow.Local()
+	wy, wm, wd := wallLocal.Date()
+	dy, dm, dd := displayAt.Date()
+	if wy != dy || wm != dm || wd != dd {
+		stampLayout = "Jan 02 15:04:05"
+	}
+	stamp := displayAt.Format(stampLayout)
+	if p.live {
+		return "REALTIME · at " + stamp
+	}
+	state := fmt.Sprintf("%gx", p.speed)
+	if p.speed == 0 {
+		state = "PAUSED"
+	}
+	return fmt.Sprintf("%s · at %s · %s behind", state, stamp, playbackLag(p.Behind(wallNow)))
+}
+
+func playbackLag(d time.Duration) string {
+	if d <= 0 {
+		return "0s"
+	}
+	return d.Truncate(time.Second).String()
+}
+
+func (m *Model) showSeekOverlay(moved time.Duration) {
+	if moved <= 0 {
+		return
+	}
+	now := time.Now()
+	if !m.seekOverlayAt.IsZero() && now.Sub(m.seekOverlayAt) >= 0 && now.Sub(m.seekOverlayAt) < seekOverlayTTL {
+		m.seekOverlay += moved
+	} else {
+		m.seekOverlay = moved
+	}
+	m.seekOverlayAt = now
+}
+
+// renderSeekOverlay composites a small video-player-style badge over an
+// already-rendered frame. ansi.Cut preserves the styling on either side while
+// replacing only the centred panel's cells, so frame geometry never changes.
+func (m *Model) renderSeekOverlay(frame string, w, h int) string {
+	if m.seekOverlay <= 0 || m.seekOverlayAt.IsZero() ||
+		time.Since(m.seekOverlayAt) >= seekOverlayTTL || w < 8 || h < 3 {
+		return frame
+	}
+	seconds := m.seekOverlay.Seconds()
+	var amount string
+	if m.seekOverlay%time.Second == 0 {
+		amount = fmt.Sprintf("− %d seconds", int64(seconds))
+	} else {
+		amount = fmt.Sprintf("− %.1f seconds", seconds)
+	}
+	if seconds == 1 {
+		amount = "− 1 second"
+	}
+
+	t := theme.Current
+	panelW, panelH := min(w, max(18, runewidth.StringWidth(amount)+6)), 3
+	panel := newCanvas(panelW, panelH, t.Panel, t.PanelFg)
+	drawBorder(panel, panelW, panelH, borderSolid, t.Accent, t.Panel)
+	panel.textCenter(0, 1, panelW, amount, t.PanelFg, true)
+	panelLines := strings.Split(panel.String(), "\n")
+
+	lines := strings.Split(frame, "\n")
+	for len(lines) < h {
+		lines = append(lines, padRow("", w))
+	}
+	x, y := (w-panelW)/2, (h-panelH)/2
+	for i, overlay := range panelLines {
+		row := padRow(lines[y+i], w)
+		left := ansi.Cut(row, 0, x)
+		right := ansi.Cut(row, x+panelW, w)
+		lines[y+i] = padRow(left+overlay+right, w)
+	}
+	return strings.Join(lines[:h], "\n")
+}
+
 // legendHeight is the row count of the legend strip.
 //
 // Two rows, because there are exactly two visual languages on screen: the
-// border says what the node is doing, the fill says what its pods are doing.
+// labelled chip says what the node is doing, the fill says what its pods are doing.
 // (This was three rows while pod cells could be coloured by workload; with
 // state-only colouring the "colour" and "shape" rows said the same thing, which
 // is precisely the clutter that made the picture hard to read.)
@@ -211,83 +375,94 @@ const legendHeight = 2
 // podStates is the full pod-cell key: colour and glyph together, in one place,
 // so the legend and the renderer cannot drift.
 var podStates = []struct {
-	glyph rune
-	label string
+	glyph  rune
+	marker rune
+	label  string
 }{
-	{glyphRunning, "running"},
-	{glyphPending, "pending"},
-	{glyphTerminating, "terminating"},
-	{glyphFailed, "failed"},
+	{glyphRunning, '●', "running"},
+	{glyphPending, '○', "pending"},
+	{glyphTerminating, '◐', "terminating"},
+	{glyphFailed, '×', "failed"},
 }
 
-// renderLegend explains every colour on screen in two labelled rows.
+// renderLegend uses the same filled, labelled chips for both visual languages.
+// A hairline colour sample asks the audience to perform a visual lookup; a
+// labelled chip makes the mapping self-evident and remains readable on a
+// projector.
 func (m *Model) renderLegend(w int) string {
 	t := theme.Current
 	c := newCanvas(w, legendHeight, t.Bg, t.Fg)
 
 	const labelCol = 8 // width of the "node"/"pods" row labels
 
-	// Reserve the utilisation ramp on the right first; the chip rows then fill
-	// the space to its left and stop cleanly rather than overprinting it.
-	const rampPre, rampPost = "meter ", " 0→100%"
-	rampW := clampInt(w/6, 0, 22)
-	rampX := w - rampW - len(rampPost) - 2
-	limit := w - 2
-	if rampW >= 8 && rampX-len(rampPre) > labelCol+34 {
-		// Drawn as a background fill, exactly as the meters are — using the pod
-		// cell glyph here would put a row of █ in the node row and blur the very
-		// distinction this legend exists to draw.
-		for i := 0; i < rampW; i++ {
-			c.rect(rampX+i, 0, 1, 1, t.Util(float64(i)/float64(rampW-1)))
-		}
-		c.text(rampX-len(rampPre), 0, rampPre, t.Dim, false)
-		c.text(rampX+rampW, 0, rampPost, t.Dim, false)
-		limit = rampX - len(rampPre) - 2
-	}
-
-	// Row 0 — node phase, drawn as the border glyph it actually is, never as the
-	// solid block a pod cell uses.
+	// Current exceptional states come first, followed by the remaining lifecycle
+	// reference. Narrow terminals therefore lose quiet/reference chips before a
+	// state that is actually happening in the cluster.
 	c.text(1, 0, "node", t.Dim, true)
 	x := labelCol
-	for _, p := range []model.Phase{model.PhaseReady, model.PhaseProvisioning, model.PhaseCordoned,
-		model.PhaseDraining, model.PhaseDeleting, model.PhaseNotReady} {
-		label := strings.ToLower(p.String())
-		if x+4+len(label) > limit {
-			break
+	present := map[model.Phase]bool{}
+	for _, n := range m.snap.Nodes {
+		present[n.Phase] = true
+	}
+	ordered := []model.Phase{model.PhaseTerminating, model.PhaseDraining, model.PhaseCordoned,
+		model.PhaseNotReady, model.PhaseProvisioning, model.PhaseReady}
+	var phases []model.Phase
+	for _, wantPresent := range []bool{true, false} {
+		for _, p := range ordered {
+			if present[p] == wantPresent {
+				phases = append(phases, p)
+			}
 		}
-		c.text(x, 0, borderSample(p), t.PhaseColor(int(p)), true)
-		c.text(x+3, 0, label, t.Dim, false)
-		x += 5 + len(label)
+	}
+	for _, p := range phases {
+		label := phaseChipLabel(p)
+		chipW := runewidth.StringWidth(label) + 2
+		if x+chipW > w-2 {
+			label = phaseIcon(p) + " " + strings.ToUpper(phaseShortLabel(p))
+			chipW = runewidth.StringWidth(label) + 2
+		}
+		if x+chipW > w-2 {
+			continue
+		}
+		col := phaseEdge(p)
+		c.rect(x, 0, chipW, 1, col)
+		c.text(x, 0, " "+label+" ", contrastOn(col), true)
+		x += chipW + 1
 	}
 
-	// Row 1 — pod cells: colour and glyph are the same signal, shown together.
+	// Row 1 — pod states get the same visual weight as node phases. Compact
+	// markers keep the chips readable without making the pod field itself busy.
 	c.text(1, 1, "pods", t.Dim, true)
 	x = labelCol
 	for _, st := range podStates {
-		if x+4+len(st.label) > w-2 {
+		label := string(st.marker) + " " + strings.ToUpper(st.label)
+		chipW := runewidth.StringWidth(label) + 2
+		if x+chipW > w-2 {
 			break
 		}
-		c.text(x, 1, string(st.glyph)+string(st.glyph), stateColor(st.label), true)
-		c.text(x+3, 1, st.label, t.Dim, false)
-		x += 5 + len(st.label)
+		col := stateColor(st.label)
+		c.rect(x, 1, chipW, 1, col)
+		c.text(x, 1, " "+label+" ", contrastOn(col), true)
+		x += chipW + 1
 	}
 	if x+24 <= w-2 {
 		c.text(x, 1, "· cell size = cpu request", t.Dim, false)
+		x += 26
+	}
+
+	// Utilisation remains a rail because that is the exact shape used by the
+	// header and dense view, but it no longer steals room from lifecycle states.
+	const rampPre, rampPost = "meter ", " 0→100%"
+	rampW := clampInt(w/7, 0, 18)
+	rampX := w - rampW - len(rampPost) - 2
+	if rampW >= 8 && rampX-len(rampPre) > x {
+		for i := 0; i < rampW; i++ {
+			c.hMeterRail(rampX+i, 1, 1, 1, t.Util(float64(i)/float64(rampW-1)), t.Empty)
+		}
+		c.text(rampX-len(rampPre), 1, rampPre, t.Dim, false)
+		c.text(rampX+rampW, 1, rampPost, t.Dim, false)
 	}
 	return c.String()
-}
-
-// borderSample is the glyph the legend shows for a phase — the same border
-// glyph the node box draws, so the swatch cannot be mistaken for a pod cell.
-func borderSample(p model.Phase) string {
-	switch p {
-	case model.PhaseProvisioning:
-		return "┊┊"
-	case model.PhaseDraining, model.PhaseDeleting, model.PhaseNotReady:
-		return "┃┃"
-	default:
-		return "││"
-	}
 }
 
 // helpText is rendered into the overlay. Generated from the registry so it can
@@ -295,13 +470,16 @@ func borderSample(p model.Phase) string {
 func helpLines(includeDemo bool) []string {
 	out := []string{
 		"KEYS",
-		"  ↑↓←→ / hjkl   move selection          :        command bar",
-		"  pgup pgdn     scroll                  /        filter nodes by name",
+		"  ↑↓←→ / hjkl   move selection          enter    node details + events",
+		"  pgup pgdn     scroll                  :        command bar",
+		"                                        /        filter nodes by name",
 		"  g / G         first / last            \\        clear all filters",
-		"  p             pods ⇄ utilisation      d        dense table mode",
-		"  u             requests ⇄ usage        s / S    cycle sort / reverse",
+		"  v             cycle view modes          d        dense mode",
+		"  s / S         cycle sort / reverse",
 		"  l             toggle legend           ?        this help",
 		"  z / Z         zoom in / out           0        zoom to fit",
+		"  p             pause / resume          [        rewind 5 seconds",
+		"                                        r        jump to realtime",
 		"  q             quit",
 		"",
 		"MOUSE / TRACKPAD",
@@ -311,11 +489,17 @@ func helpLines(includeDemo bool) []string {
 		"    two-finger scroll          (the selection comes with it)",
 		"  click / drag                 select a node",
 		"",
+		"NODE DETAILS (enter)",
+		"  esc / backspace / q          back to the grid, exactly as you left it",
+		"  ↑↓ jk pgup pgdn g G          scroll · wheel scrolls too",
+		"  ctrl+r                       re-read live detail now",
+		"",
 	}
 	if includeDemo {
 		out = append(out,
 			"DEMO KEYS (simulated cluster only)",
 			"  +   scale up one node      -   drain a node      x   churn pods",
+			"  b   submit 8 pods with no node (they pile up in the pending meter)",
 			"")
 	}
 	out = append(out, "COMMANDS")

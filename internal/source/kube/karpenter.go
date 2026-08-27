@@ -68,19 +68,22 @@ func (s *Source) upsertNodePool(obj interface{}) {
 }
 
 // upsertNodeClaim registers the claim so a scale-up is visible before the Node
-// object exists. Once status.nodeName is set the store hands ownership to the
-// real Node and the placeholder disappears.
+// object exists. The store hands ownership to the real Node and drops the
+// placeholder as soon as the two can be matched — by providerID if Karpenter has
+// launched the instance, otherwise by name once status.nodeName is set.
 func (s *Source) upsertNodeClaim(obj interface{}) {
 	u, ok := obj.(*unstructured.Unstructured)
 	if !ok {
 		return
 	}
 	nodeName, _, _ := unstructured.NestedString(u.Object, "status", "nodeName")
+	providerID, _, _ := unstructured.NestedString(u.Object, "status", "providerID")
 	labels := u.GetLabels()
 
 	placeholder := &model.Node{
 		Name:         valueOr(nodeName, u.GetName()),
 		NodeClaim:    u.GetName(),
+		ProviderID:   providerID,
 		NodePool:     labels[labelNodePool],
 		InstanceType: labels[labelInstanceType],
 		Zone:         labels[labelZone],
@@ -99,7 +102,7 @@ func (s *Source) upsertNodeClaim(obj interface{}) {
 	if alloc, found, _ := unstructured.NestedStringMap(u.Object, "status", "allocatable"); found {
 		placeholder.Allocatable = quantityMap(alloc)
 	}
-	if p, ok := parsePrice(u.GetAnnotations()); ok {
+	if p, ok := parsePrice(u.GetAnnotations(), s.opts.PriceAnnotation); ok {
 		placeholder.Price, placeholder.HasPrice = p, true
 	}
 
